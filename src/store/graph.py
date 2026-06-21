@@ -151,6 +151,19 @@ class CitationGraph:
             )
         """)
 
+        # Link citations to concepts (evidence relationships)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS citation_concept_links (
+                citation_id TEXT NOT NULL,
+                concept_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                evidence_text TEXT,
+                PRIMARY KEY (citation_id, concept_id),
+                FOREIGN KEY (citation_id) REFERENCES citation_nodes(id),
+                FOREIGN KEY (concept_id) REFERENCES concept_nodes(id)
+            )
+        """)
+
         await self._db.commit()
         logger.debug("Citation tables created")
 
@@ -249,6 +262,58 @@ class CitationGraph:
         ) as cursor:
             count = await cursor.fetchone()
             return count[0] == 0 if count else True
+
+    # Citation-Concept linking operations
+
+    async def add_citation_concept_link(
+        self,
+        citation_id: str,
+        concept_id: str,
+        relation_type: str,
+        evidence_text: str | None = None,
+    ) -> None:
+        """
+        Link a citation to a concept node.
+        
+        Args:
+            citation_id: ID of the paper (DOI/arXiv)
+            concept_id: ID of the concept node
+            relation_type: "introduces", "uses", "evaluates", "extends"
+            evidence_text: Excerpt from paper supporting this link
+        """
+        assert self._db is not None
+        
+        await self._db.execute(
+            """
+            INSERT OR REPLACE INTO citation_concept_links
+            (citation_id, concept_id, relation_type, evidence_text)
+            VALUES (?, ?, ?, ?)
+            """,
+            (citation_id, concept_id, relation_type, evidence_text),
+        )
+        await self._db.commit()
+
+    async def get_concepts_for_citation(self, citation_id: str) -> list[str]:
+        """Get concept IDs linked to a citation."""
+        assert self._db is not None
+        
+        async with self._db.execute(
+            "SELECT concept_id FROM citation_concept_links WHERE citation_id = ?",
+            (citation_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def get_citations_for_concept(self, concept_id: str) -> list[str]:
+        """Get citation IDs linked to a concept."""
+        assert self._db is not None
+        
+        async with self._db.execute(
+            "SELECT citation_id FROM citation_concept_links WHERE concept_id = ?",
+            (concept_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
 
 
 class KnowledgeGraph:
@@ -454,3 +519,41 @@ class KnowledgeGraph:
         """Compute a stable ID for a concept."""
         normalized = f"{category}:{label.lower().strip()}"
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+    # Concept-Interest linking operations (cross-reference with UserMemory)
+    # Note: The actual linking table is in UserMemory, this is a helper
+
+    async def find_matching_concepts_for_interest(
+        self, interest_label: str, min_similarity: float = 0.8
+    ) -> list[tuple[str, float]]:
+        """
+        Find concept nodes that match an interest label.
+        
+        This uses exact match for now, can be enhanced with embeddings.
+        
+        Returns: [(concept_id, similarity_score), ...]
+        """
+        # Try exact match first
+        concept = await self.find_concept_by_label(interest_label)
+        if concept:
+            return [(concept.id, 1.0)]
+        
+        # Try case-insensitive match
+        async with self._db.execute(
+            "SELECT id, label FROM concept_nodes WHERE LOWER(label) = LOWER(?)",
+            (interest_label,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            if rows:
+                return [(row[0], 0.95) for row in rows]
+        
+        # Try fuzzy match (simple substring)
+        async with self._db.execute(
+            "SELECT id, label FROM concept_nodes WHERE label LIKE ?",
+            (f"%{interest_label}%",)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            if rows:
+                return [(row[0], 0.8) for row in rows]
+        
+        return []
