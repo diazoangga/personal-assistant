@@ -1,0 +1,53 @@
+# Seed Topics Configuration
+
+# Initial topics to bootstrap interest modeling
+# The assistant will track these topics and related concepts
+
+[seed_topics]
+categories = [
+    "artificial intelligence",
+    "machine learning",
+    "deep learning",
+    "natural language processing",
+    "computer vision",
+]
+
+engineering = [
+    "software engineering",
+    "distributed systems",
+    "cloud architecture",
+    "devops",
+    "site reliability engineering",
+]
+
+languages = [
+    "python",
+    "typescript",
+    "rust",
+    "go",
+    "java",
+]
+
+frameworks = [
+    "pytorch",
+    "tensorflow",
+    "react",
+    "vue",
+    "spring boot",
+]
+
+domains = [
+    "fintech",
+    "healthcare",
+    "education technology",
+    "climate tech",
+]
+
+# Topic decay settings
+[decay]
+# Daily decay rate for inactive topics
+default_rate = 0.01
+# Minimum strength to keep a topic
+min_strength = 0.1
+# Strength boost when topic is active
+activity_boost = 0.15

@@ -1,0 +1,95 @@
+[tool.poetry]
+name = "personal-assistant"
+version = "0.1.0"
+description = "AI Personal Assistant with OpenRouter and Gemma4-31B"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [
+    { include = "src", from = "." }
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+# Core
+httpx = "^0.25.0"
+pydantic = "^2.0.0"
+toml = "^0.10.2"
+
+# Async & orchestration
+langgraph = "^0.2.0"
+langchain-core = "^0.3.0"
+
+# Storage
+qdrant-client = "^1.7.0"
+aiosqlite = "^0.19.0"
+sentence-transformers = "^2.2.0"
+
+# CLI
+typer = "^0.9.0"
+rich = "^13.0.0"
+
+# Slack (optional)
+slack-bolt = "^1.18.0"
+python-socketio = "^5.0.0"
+
+# Connectors
+PyGithub = "^2.1.0"
+arxiv = "^2.0.0"
+feedparser = "^6.0.0"
+
+# Utilities
+python-dotenv = "^1.0.0"
+tenacity = "^8.2.0"
+einops = "^0.8.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-asyncio = "^0.21.0"
+black = "^23.0.0"
+ruff = "^0.1.0"
+mypy = "^1.5.0"
+pytest-cov = "^4.1.0"
+faker = "^20.0.0"
+
+[tool.poetry.scripts]
+pa = "src.adapters.cli.app:app"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --cov=src --cov-report=term-missing --cov-report=html"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]

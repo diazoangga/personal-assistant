@@ -1,182 +1,190 @@
 ---
-title: "Implementation: Daily Research Agent"
+title: "Implementation: Activity Sensing Pipeline"
 created: 2026-06-20
-updated: 2026-06-20
-version: 1.0.0
+updated: 2026-06-21
+version: 3.0.0
 status: Draft
-tags: [implementation, research, ingestion, digest]
+tags: [implementation, ingestion, sensing, signals, connectors, activity]
+changelog:
+  - version: 1.0.0
+    date: 2026-06-20
+    changes: "Initial Daily Research Agent (SDLC builder Loop 1)"
+  - version: 2.0.0
+    date: 2026-06-21
+    changes: >-
+      Rewritten as the Ingestion & Sensing pipeline (Loop A) for the cognitive
+      engine. Generalized 'sources' to 'connectors' (GitHub/browser/Slack/calendar
+      added to RSS/arXiv/HN), emit signal events for the Interest Agent, and
+      reframed the digest as a proactive insight digest. Merges what an earlier
+      draft split into 'Knowledge Agent' and 'Research Radar Agent'. (Filename kept
+      to preserve cross-links.)
+  - version: 3.0.0
+    date: 2026-06-21
+    changes: >-
+      Narrowed scope (plans.md v4.0.0). Research-source connectors (arXiv, GitHub
+      trending, Medium, news) and the resulting Knowledge Base writes moved to the
+      new Research Agent ([06-research-agent.md](06-research-agent.md)), which is
+      triggered by the Interest Agent rather than pulled on a blind schedule. This
+      pipeline now does exactly one job: turn **activity** signals (what you do)
+      into the feed the Interest Agent classifies. Insight-digest building moved to
+      the Opportunity Agent ([05-meta-agent-and-skills.md](05-meta-agent-and-skills.md) §5)
+      since it now synthesizes across Research Agent findings, not just this
+      pipeline's output. (Filename kept again to preserve cross-links; content has
+      fully turned over twice now — a rename is worth reconsidering, see the note
+      at the bottom.)
 related:
   - ../personal-assistant.plans.md
   - 03-vector-db-and-storage.md
+  - 06-research-agent.md
 ---
 
 > Whenever this documentation file changes, update the `updated` field and append a new entry to `changelog` describing the revision.
 
-# Implementation: Daily Research Agent (Loop 1)
+# Implementation: Activity Sensing Pipeline
 
-The Daily Research Agent runs on a schedule, independent of any user command. It
-fills the Knowledge Base so that when a `build` runs later, the Meta-Agent already
-has relevant research on hand. Its visible output is a categorized digest in
-`#daily-intelligence` (and `pa digest`).
+> **This is a pipeline, not an agent.** It pulls **activity** signals, normalizes,
+> dedupes, and emits them — a fixed transform with no goals and no decisions. Per D4
+> that makes it a pipeline of skills/tools, not an agent. (It is the activity half
+> of what an earlier draft over-split into a "Knowledge Agent" and a "Research Radar
+> Agent"; the research half is now the **Research Agent** — a real decider — in
+> [06-research-agent.md](06-research-agent.md).)
+
+It runs on a schedule, independent of any user command. Its only job is to keep the
+**Interest Agent** fed with a true picture of what the user is doing — browsing,
+committing code, meetings, conversations. It does **not** write to the Knowledge
+Base; that's the Research Agent's job, triggered by what this pipeline indirectly
+causes the Interest Agent to classify.
 
 ```
-scheduler @ 07:00
+scheduler (sensing_cron)
       │
       ▼
-  pull sources ─► dedupe ─► quality score ─► semantic chunk ─► embed ─► store (KB)
-      │                                                                     │
-      └──────────────────────────► rank per topic ──► build digest ◄────────┘
-                                                          │
-                                          deliver: Slack #daily-intelligence + CLI
+  pull activity connectors ─► normalize ─► dedupe ─► tag ─► store (signal log)
+                                                                  │
+                                                                  ▼
+                                                   emit Signal events ──► Interest Agent
+                                                                              │
+                                                                              ▼
+                                                              (classification may trigger
+                                                               the Research Agent — see
+                                                               05-meta-agent-and-skills.md §4)
 ```
 
 ---
 
-## 1. Sources (pluggable adapters)
+## 1. Connectors (pluggable, activity-only)
 
-Each source is a small adapter returning normalized `RawItem`s. Adding a source is
-adding one file — no pipeline changes.
+Each connector is a small adapter returning normalized `RawSignal`s. Adding one is
+adding a file — no pipeline changes.
 
 ```python
-# pa/research/sources/base.py
+# src/ingest/connectors/base.py
 @dataclass
-class RawItem:
+class RawSignal:
     title: str
-    url: str
-    body: str            # fetched/summarized text
-    source_type: str     # "hn" | "github" | "arxiv" | "rss"
-    published_at: str
+    url: str | None
+    body: str
+    connector: str        # "github" | "browser" | "slack" | "calendar"
+    occurred_at: str
 
-class Source(Protocol):
-    async def fetch(self, topics: list[Topic]) -> list[RawItem]: ...
+class Connector(Protocol):
+    async def fetch(self, since: str) -> list[RawSignal]: ...
 ```
 
-| Source | Adapter | Notes |
-|--------|---------|-------|
-| Hacker News | `sources/hn.py` | Algolia API; filter by topic keywords + min points |
-| GitHub Trending | `sources/github.py` | Trending repos by language/topic |
-| arXiv | `sources/arxiv.py` | Query API per topic; abstracts |
-| RSS / blogs | `sources/rss.py` | User-listed feeds in `config` |
+| Connector | File | Notes |
+|-----------|------|-------|
+| GitHub (your activity) | `connectors/github.py` | your commits/repos/stars — **not** trending repos; that's the Research Agent's `github_research` connector, a different file and a different caller. **Build first.** |
+| Browser history | `connectors/browser.py` | **opt-in, M3** — strongest interest signal, most sensitive |
+| Slack | `connectors/slack.py` | **opt-in, M3** — your conversations as signal |
+| Calendar | `connectors/calendar.py` | **opt-in, M3** — activity context |
 
-Sources read the tracked **topics** (from `config/topics.toml` / the `topics`
-table) so ingestion stays focused on what the user actually cares about.
+> There is no `kind` field anymore (research vs activity) — everything this
+> pipeline touches *is* activity. If you're adding a connector that returns
+> research content (papers, articles, trending repos), it belongs in
+> `src/research/connectors/` and is called by the Research Agent, not here. See
+> [06-research-agent.md §3](06-research-agent.md#3-source-connectors-pareasarchconnectors).
 
 ---
 
-## 2. Ingestion Pipeline
+## 2. The Pipeline
 
 ```python
-# pa/research/ingest.py
-async def ingest(items: list[RawItem]) -> IngestReport:
-    items = dedupe(items)                 # content-hash; drop already-known
-    items = [i for i in items if quality(i) >= THRESHOLD]
-    chunks = []
-    for item in items:
-        for text in semantic_chunks(item.body):
-            chunks.append(make_chunk(item, text))   # carries provenance + quality
-    await knowledge.upsert(chunks)        # idempotent on chunk.id
-    return IngestReport(new=len(chunks), kept_items=len(items))
+# src/ingest/pipeline.py
+async def sense(signals: list[RawSignal]) -> SensingReport:
+    signals = dedupe(signals)                           # content-hash; drop known
+    for s in signals:
+        memory.log_signal(s)                            # raw signal log
+    await bus.publish_signals(signals)                   # → Interest Agent
+    return SensingReport(signals=len(signals))
 ```
+
+No chunking, no embedding, no Knowledge Base write — this pipeline's only store is
+the `signals` table in Persistent Memory (see
+[03-vector-db-and-storage.md §2](03-vector-db-and-storage.md#2-persistent-memory-sqlite--the-user-model)).
+That's what makes it a fixed transform rather than an agent: there is nothing to
+decide here, only normalize-and-forward.
 
 ### Deduplication
-Two layers: (1) **exact** — `chunk.id` is a hash of normalized text, so re-ingesting
-the same article is a no-op; (2) **near-duplicate** — before upsert, check cosine
-similarity against the KB; if a near-identical chunk exists, keep the
-higher-quality source and skip the rest. This is what keeps the KB from rotting
-into noise over weeks of daily runs.
-
-### Quality scoring
-A cheap score gates what enters the KB. Combine signals available at ingest:
-source authority (e.g. HN points, GitHub stars), recency, topic-match strength
-(retrieval similarity to the topic's keywords), and body length/substance. Items
-below threshold are dropped, not stored. Store the score on the chunk so retrieval
-can prefer higher-quality material on ties.
-
-### Chunking & embedding
-Semantic chunking + local embeddings — see
-[03-vector-db-and-storage.md](03-vector-db-and-storage.md) §1. Reuse that code; the
-research loop is a *producer* for the same store the SDLC pipeline *consumes*.
+Content-hash on `(connector, title, occurred_at)` — re-sensing the same activity
+window is a no-op.
 
 ---
 
-## 3. The Digest
-
-After ingest, rank the day's new items **per topic** and render a digest. Keep it
-skimmable: 3–5 items per topic, each with a one-line "why it matters."
-
-```python
-# pa/research/digest.py
-async def build_digest(report: IngestReport, topics: list[Topic]) -> Digest:
-    sections = []
-    for topic in topics:
-        top = rank(report.items_for(topic), k=5)     # quality + recency + match
-        sections.append(DigestSection(topic.name, [summarize_one_line(i) for i in top]))
-    return Digest(date=today(), sections=sections)
-```
-
-Delivery is interface-symmetric:
-- **Slack:** Block Kit — header + one section per topic + `/ask` footer hint. Posted
-  via the Slack adapter's `post_digest()` sink (see
-  [02-slack-gateway.md](02-slack-gateway.md) §5).
-- **CLI:** `pa digest [date]` renders the same `Digest` object with Rich.
-
-The digest is produced once by the Core Engine and rendered by whichever interface
-asks for it — never computed twice.
-
----
-
-## 4. Scheduling & Compute Safety
+## 3. Scheduling & Compute Safety
 
 ```toml
 [schedule]
-daily_research_cron = "0 7 * * *"
-build_quiet_hours   = ["07:00", "08:00"]
+sensing_cron    = "0 * * * *"    # this pipeline: hourly
+understand_cron = "0 7 * * *"    # Interest Agent rollup
 ```
 
-- **Scheduler:** cron calling `pa research now`, or APScheduler inside a long-running
-  engine process. Either submits a `ResearchNow` command — the same path the user's
-  manual `/research` uses (parity again).
-- **Concurrency guard (critical on local hardware):** the digest job loads the
-  embedding model; a `build` loads the big worker model. The guard in
-  `llm/ollama.py` ensures these don't co-load and thrash VRAM. If a build is
-  queued during quiet hours, the digest waits.
+- **Scheduler:** cron calling `pa ingest now`, or APScheduler in a long-running
+  engine. Either submits an `IngestNow` command — the same path manual `/ingest`
+  uses (parity).
+- **Concurrency guard:** this pipeline does no LLM/embedding work itself (no
+  chunking), so it doesn't compete for VRAM the way the Research Agent does. Keep
+  it that way — if a future activity connector needs classification at fetch time,
+  push that into the Interest Agent instead of adding model calls here.
 
 ---
 
-## 5. Proactive Alerts (Phase 3)
+## 4. Privacy & Retention (gates the M3 connectors)
 
-Beyond the scheduled digest, the agent can **initiate contact** when a tracked
-topic gets a high-signal hit (e.g. a release or paper far above the quality
-threshold). This is the 2026 "assistant reaches out when something needs your
-attention" pattern. Implement as a post-ingest check that, on a strong hit, submits
-a lightweight notify command → a single Slack message, rate-limited so it never
-becomes noise.
-
----
-
-## 6. The Loop 1 → Loop 2 Bridge
-
-This is the payoff. When `build` runs, the Research Worker's *first* move is a
-Knowledge Base query (see [05-meta-agent-and-skills.md](05-meta-agent-and-skills.md)) —
-hitting research this agent already ingested. Most of the time the worker answers
-feasibility from local knowledge and never touches the live web. Yesterday's
-reading becomes today's feasibility report; that's the whole reason Loop 1 exists.
+The personal connectors (browser, Slack, calendar) are the strongest signals **and**
+the most sensitive. Before enabling any of them:
+- **Opt-in per connector** in `config/settings.toml`.
+- **Local-only (D1):** signals never leave the machine; all inference is local.
+- **Retention policy:** an aging job prunes raw activity signals after N days; pin
+  anything referenced by a saved opportunity.
 
 ---
 
-## 7. Testing
+## 5. Testing
 
-- **Source adapters:** record/replay fixtures (VCR-style); assert normalization to `RawItem`.
-- **Dedup:** feed overlapping batches; assert no duplicate chunks and that the
-  higher-quality source wins near-dup conflicts.
-- **Digest:** given a fixed `IngestReport`, snapshot the rendered Block Kit + CLI output.
-- **Bridge test:** ingest a fixture, then run a Research Worker query and assert it
-  retrieves the ingested chunk without a network call.
+- **Connectors:** record/replay fixtures (VCR-style); assert normalization to `RawSignal`.
+- **Dedup:** overlapping batches → no duplicate signal rows.
+- **Signal emission:** assert every sensed signal reaches the Interest Agent's queue.
+- **Bridge test:** sense a fixture activity batch, run the Interest Agent, assert
+  the resulting classification is what triggers (or correctly doesn't trigger) a
+  Research Agent run.
+
+---
+
+## A note on this file's name
+
+This is the second time this file's content has fully turned over while the
+filename stayed `04-daily-research-agent.md` for cross-link stability. It no longer
+describes a research agent at all — it describes activity sensing. If you're
+touching this area of the docs next, consider `git mv` to
+`04-activity-sensing-pipeline.md` and fixing the handful of relative links (this
+doc, plus [05](05-meta-agent-and-skills.md), [06](06-research-agent.md), and
+[plans.md](../personal-assistant.plans.md) all reference it by current filename).
+Not done here to avoid an unrequested rename mid-revision.
 
 ---
 
 ## Related
-- [03-vector-db-and-storage.md](03-vector-db-and-storage.md) — the store this fills
-- [02-slack-gateway.md](02-slack-gateway.md) — digest delivery sink
-- [05-meta-agent-and-skills.md](05-meta-agent-and-skills.md) — the consumer
+- [03-vector-db-and-storage.md](03-vector-db-and-storage.md) — the signal log this pipeline fills
+- [06-research-agent.md](06-research-agent.md) — what the Interest Agent's classification triggers next
+- [05-meta-agent-and-skills.md](05-meta-agent-and-skills.md) — the Interest Agent consumer; Opportunity Agent (digest)
 - [../personal-assistant.implementation.md](../personal-assistant.implementation.md)
