@@ -74,3 +74,22 @@ log_level = "INFO"                # Logging level: DEBUG, INFO, WARNING, ERROR
 log_file = "./data/daemon.log"    # Where to write daemon logs
 pid_file = "./data/daemon.pid"    # Where to store daemon PID
 state_file = "./data/daemon_state.json"  # Daemon state persistence
+
+[connectors.slack]
+# Slack workspace monitoring
+enabled = false                   # Set to true to enable
+slack_token = "${SLACK_BOT_TOKEN}"  # From environment or .env
+channels = ["#general"]           # Channels to monitor (empty = all joined)
+include_dms = true                # Also monitor direct messages
+
+[connectors.browser]
+# Browser history monitoring
+enabled = false                   # Set to true to enable
+browsers = ["chrome", "firefox"]  # Which browsers to monitor
+track_searches = true             # Track search queries
+track_page_visits = true          # Track visited pages
+min_time_on_page = 2              # Only track pages with 2+ seconds spent
+exclude_domains = [               # Don't track these domains
+    "localhost",
+    "127.0.0.1",
+]

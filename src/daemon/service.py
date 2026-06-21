@@ -78,9 +78,49 @@ class PersonalAssistantDaemon:
             self.engine = PersonalAssistantEngine(self.config.config)
             await self.engine.initialize()
             self.logger.info("Engine initialized successfully")
+
+            # Initialize connectors
+            self._initialize_connectors()
         except Exception as e:
             self.logger.error(f"Failed to initialize engine: {e}", exc_info=True)
             raise
+
+    def _initialize_connectors(self) -> None:
+        """Initialize and register activity connectors based on config."""
+        from .connectors import GitHubConnector, SlackConnector, BrowserConnector
+        from .connector_base import register_connector
+
+        connectors_config = self.config.config.get("connectors", {})
+
+        # GitHub connector
+        if connectors_config.get("github", {}).get("enabled", True):
+            try:
+                github_config = connectors_config.get("github", {})
+                connector = GitHubConnector(github_config)
+                register_connector(connector)
+                self.logger.info("GitHub connector registered")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize GitHub connector: {e}")
+
+        # Slack connector
+        if connectors_config.get("slack", {}).get("enabled", False):
+            try:
+                slack_config = connectors_config.get("slack", {})
+                connector = SlackConnector(slack_config)
+                register_connector(connector)
+                self.logger.info("Slack connector registered")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize Slack connector: {e}")
+
+        # Browser connector
+        if connectors_config.get("browser", {}).get("enabled", False):
+            try:
+                browser_config = connectors_config.get("browser", {})
+                connector = BrowserConnector(browser_config)
+                register_connector(connector)
+                self.logger.info("Browser connector registered")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize Browser connector: {e}")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown the daemon."""

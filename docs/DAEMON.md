@@ -182,7 +182,7 @@ option2 = "value2"
 
 ## Built-in Connectors
 
-### GitHub
+### GitHub ✓
 Fetches commits, PRs, issues, and comments.
 
 ```toml
@@ -198,15 +198,81 @@ Signals:
 - `issue` - Issue opened/closed/reopened
 - `comment` - Comments on issues/PRs
 
-### Browser (TODO)
-Fetches web search history, visited pages, time spent.
+**Example signals:**
+```python
+source="github", event_type="commit", data={"repo": "my-project", "message": "Fix bug", "files": 3}
+source="github", event_type="pull_request", data={"repo": "my-project", "action": "opened", "title": "Add feature"}
+```
+
+### Browser ✓
+Monitors web search queries and visited pages with time spent.
 
 ```toml
 [connectors.browser]
 enabled = false
-# Supported: "chrome", "firefox", "safari"
-browsers = ["chrome"]
+browsers = ["chrome", "firefox"]  # Which browsers to monitor
+track_searches = true             # Track search queries
+track_page_visits = true          # Track visited pages
+min_time_on_page = 2              # Only track pages with 2+ seconds
+exclude_domains = [               # Don't track localhost, etc.
+    "localhost",
+    "127.0.0.1",
+]
 ```
+
+Signals:
+- `search` - Search queries (Google, Bing, DuckDuckGo, etc.)
+- `page_visit` - Pages visited with time spent
+
+**Example signals:**
+```python
+source="browser", event_type="search", data={"query": "transformer models", "engine": "google"}
+source="browser", event_type="page_visit", data={"url": "https://arxiv.org/...", "title": "Paper", "domain": "arxiv.org", "time_spent_seconds": 45}
+```
+
+**How it works:**
+- Reads SQLite history databases directly from Chrome/Firefox
+- Safely copies database files to avoid locking issues
+- Converts timestamps correctly
+- Filters by domain and time thresholds
+- Works on Windows & macOS
+
+**Browser history locations:**
+- **Chrome (Windows)**: `~\AppData\Local\Google\Chrome\User Data\Default\History`
+- **Chrome (macOS)**: `~/Library/Application Support/Google/Chrome/Default/History`
+- **Firefox (Windows)**: `~\AppData\Roaming\Mozilla\Firefox\Profiles\*.default-release\places.sqlite`
+- **Firefox (macOS)**: `~/Library/Application Support/Firefox/Profiles/*.default-release/places.sqlite`
+
+### Slack ✓
+Monitors messages in joined channels and direct messages.
+
+```toml
+[connectors.slack]
+enabled = false                   # Set to true to enable
+slack_token = "${SLACK_BOT_TOKEN}"  # From .env
+channels = []                     # Empty = all joined channels, or ["#general", "#dev"]
+include_dms = true                # Also monitor direct messages
+```
+
+Signals:
+- `message` - Channel messages and DMs
+- `reaction` - Emoji reactions
+- `thread_reply` - Replies in threads
+
+**Example signals:**
+```python
+source="slack", event_type="message", data={"channel": "#general", "user": "diazangga", "text": "Great idea!", "thread": False}
+source="slack", event_type="message", data={"channel": "@alice", "user": "alice", "text": "Thanks!", "is_dm": True}
+source="slack", event_type="reaction", data={"channel": "#dev", "emoji": "thumbsup", "message_text": "..."}
+```
+
+**Setup:**
+1. Create a Slack app at https://api.slack.com/apps
+2. Enable these scopes: `channels:history`, `groups:history`, `im:history`, `mpim:history`, `reactions:read`
+3. Install the app to your workspace
+4. Copy the Bot Token (starts with `xoxb-`)
+5. Add to `.env`: `SLACK_BOT_TOKEN=xoxb-...`
+6. Enable in settings.toml: `[connectors.slack] enabled = true`
 
 ### VSCode (TODO)
 Fetches file edits, extensions used, debugging sessions.
@@ -215,16 +281,6 @@ Fetches file edits, extensions used, debugging sessions.
 [connectors.vscode]
 enabled = false
 workspace_path = "~/projects"
-```
-
-### Slack (TODO)
-Fetches messages, reactions, threads in joined channels.
-
-```toml
-[connectors.slack]
-enabled = false
-slack_token = "${SLACK_BOT_TOKEN}"
-channels = ["#general", "#dev"]
 ```
 
 ### File System (TODO)
