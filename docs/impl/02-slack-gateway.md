@@ -1,10 +1,31 @@
 ---
 title: "Implementation: Slack Gateway"
 created: 2026-06-20
-updated: 2026-06-20
-version: 1.0.0
+updated: 2026-06-21
+version: 3.0.0
 status: Draft
 tags: [implementation, slack, gateway]
+changelog:
+  - version: 1.0.0
+    date: 2026-06-20
+    changes: "Initial Slack adapter for the SDLC builder (/build, approvals)"
+  - version: 2.0.0
+    date: 2026-06-21
+    changes: >-
+      Updated for the cognitive engine. Replaced /build + approval buttons with
+      /ask, /brainstorm threads, /interests, /digest, /opps and feedback (👍/👎)
+      buttons; reframed the digest as the proactive insight digest. Socket Mode
+      and the 3-second async pattern retained.
+  - version: 3.0.0
+    date: 2026-06-21
+    changes: >-
+      Added `/research` (manual Research Agent trigger) and `/graph` (citation
+      /knowledge graph view) slash commands. Brainstorm thread sessions now run
+      the Brainstorming Agent (a full agent) rather than a Meta Agent mode, and
+      can post a "researching…" progress update if the session hands off to the
+      Research Agent mid-conversation. Repointed the digest producer reference
+      to the Opportunity Agent (impl/05), and added a self-modification review
+      surface (`/review`) for Meta Agent proposals (D6).
 related:
   - ../personal-assistant.plans.md
   - 01-cli-and-core-engine.md
@@ -17,10 +38,10 @@ reference:
 
 # Implementation: Slack Gateway
 
-Slack is the second symmetric adapter (D2). It builds the exact same `Command`
-objects as the CLI and renders the same `Event` stream — only the presentation
-(Block Kit) and the async/ack mechanics differ. If you find yourself writing agent
-or storage logic here, it belongs in the Core Engine instead.
+Slack is the second symmetric adapter (D2). It builds the same `Command` objects as
+the CLI and renders the same `Event` stream — only the presentation (Block Kit) and
+the async/ack mechanics differ. If you find yourself writing agent or storage logic
+here, it belongs in the Core Engine.
 
 ---
 
@@ -30,20 +51,19 @@ Use **Socket Mode** (WebSocket), not a public HTTP endpoint.
 
 | | Socket Mode | Events API (HTTP) |
 |---|---|---|
-| Public URL | not required | required (ngrok/host + TLS) |
-| Fit for | a single local Linux box | multi-instance, load-balanced |
+| Public URL | not required | required (tunnel + TLS) |
+| Fit for | a single local box | multi-instance, load-balanced |
 | Setup | app-level token, outbound WS | request URL verification, inbound |
 
-For a solo, local-first assistant, Socket Mode is the right call: no inbound
-firewall holes, no tunnel. (If this ever scales to multiple instances, switch to
-the Events API — the adapter boundary makes that a localized change.)
+For a solo, local-first assistant, Socket Mode is the right call: no inbound firewall
+holes, no tunnel.
 
 ```python
-# pa/adapters/slack/app.py
+# src/adapters/slack/app.py
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from pa.core import build_engine
-from pa.core.commands import Build, Ask, JobStatus, Approve, ResearchNow
+from pa.core.commands import Ask, Brainstorm, ShowInterests, Opportunities, ShowDigest, Feedback
 
 app = AsyncApp(token=BOT_TOKEN)
 engine = build_engine()
@@ -53,99 +73,113 @@ engine = build_engine()
 
 ## 2. The 3-Second Rule (the core async pattern)
 
-Slack requires `ack()` within **3 seconds** or it shows the user an error. Agent
-work takes much longer. So: **ack immediately, then stream results
-asynchronously.** `response_url` is valid for ~30 minutes, which comfortably
-covers a build.
+Slack requires `ack()` within **3 seconds**. Agent work takes longer. So: **ack
+immediately, then stream results asynchronously.**
 
 ```python
-@app.command("/build")
-async def handle_build(ack, command, respond):
-    await ack(f"🛠️ Starting build…")                      # < 3s, mandatory
-    cmd = Build(user=command["user_id"], idea=command["text"])
+@app.command("/ask")
+async def handle_ask(ack, command, respond):
+    await ack("🔎 searching your knowledge base…")        # < 3s, mandatory
+    cmd = Ask(user=command["user_id"], query=command["text"])
     job_id = await engine.submit(cmd)                      # returns instantly
-    await respond(blocks=started_blocks(job_id))
-    # stream the same Event stream the CLI renders, but as Block Kit updates
     async for ev in engine.events(job_id):
         await render_to_slack(ev, respond, command["channel_id"])
-        if isinstance(ev, Result):
-            break
+        if isinstance(ev, Result): break
 ```
 
-```
-/build ────► ack() in <3s ────► submit() ────► job_id
-                                     │
-                                     ▼
-                       engine.events(job_id) stream
-                                     │
-              Progress ──► update message via respond()/chat.update
-              ApprovalNeeded ──► post Approve/Reject buttons
-              Result ──► final summary + repo link
-```
-
-> Never do agent work inside the slash-command handler before `ack()`. Ack first,
-> always.
+> Never do agent work inside the handler before `ack()`. Ack first, always.
 
 ---
 
-## 3. Rendering the Event Stream (Block Kit)
+## 3. Brainstorm in a Thread (one thread = one session)
 
-This is the Slack twin of the CLI's `render()` table. Same events, different paint.
+The flagship interaction. A `/brainstorm` opens a thread; every reply in that thread
+becomes a `Brainstorm(text, session_id=thread_ts)` command, and the engine streams
+`Message` turns back into the thread.
+
+```python
+@app.command("/brainstorm")
+async def start_brainstorm(ack, command, client):
+    await ack()
+    root = await client.chat_postMessage(channel=command["channel_id"],
+                                         text="🧠 Brainstorm started — reply in this thread.")
+    # remember root["ts"] as the session id for this thread
+
+@app.event("message")
+async def on_thread_reply(event, say):
+    if not event.get("thread_ts"):                         # only in-thread replies
+        return
+    cmd = Brainstorm(user=event["user"], text=event["text"], session_id=event["thread_ts"])
+    job_id = await engine.submit(cmd)
+    async for ev in engine.events(job_id):
+        if isinstance(ev, Message):
+            await say(thread_ts=event["thread_ts"], blocks=message_blocks(ev))   # text + citations
+        if isinstance(ev, Result): break
+```
+
+Inquiry turns come back strict + cited; ideation turns come back as proposals with
+"why this" provenance. A "💾 Save idea" button on a proposal submits an
+`Opportunities(action="save", ref=…)` command.
+
+The Brainstorming Agent can decide, mid-session, that KB coverage is too thin and
+submit a `ResearchTopic` command itself ("research this, then propose"). When it
+does, the thread sees an interstitial progress message ("🔎 researching `<topic>`
+— this may take a minute…") before the ideation turn arrives, so the latency jump
+from a normal KB-only turn is visible rather than a silent stall.
+
+---
+
+## 4. Rendering the Event Stream (Block Kit)
+
+The Slack twin of the CLI's `render()` table. Same events, different paint.
 
 | Event | Slack rendering |
 |-------|-----------------|
-| `Started` | message: "job `<id>` started" with a Cancel button |
-| `Progress` | `chat.update` the original message: phase + message (+ progress emoji) |
-| `ApprovalNeeded` | Block Kit section with the `preview` + **Approve** / **Reject** buttons |
-| `Result(ok=True)` | summary section + repo/path link + "open report" overflow |
-| `Result(ok=False)` | error section + "view log: `/status <job>`" |
-
-To keep one tidy message instead of a noisy thread, store the `ts` of the first
-posted message per `job_id` and `chat.update` it on each `Progress`.
+| `Started` | message: "job `<id>` started" (+ Cancel button) |
+| `Progress` | `chat.update` the message: phase + message |
+| `Message` | assistant text + a "Sources" context block listing `citations` |
+| `Result(ok=True)` | summary section (e.g. opportunity list with 👍/👎 + 💾 buttons) |
+| `Result(ok=False)` | error + "view log: `/status <job>`" |
 
 ---
 
-## 4. Interactive Approvals (HITL gate)
+## 5. Feedback Buttons (the learning loop)
 
-The gate that the engine parks on (see
-[01-cli-and-core-engine.md](01-cli-and-core-engine.md) §3) surfaces in Slack as
-buttons. The button action just emits the same `Approve`/`Cancel` command.
+Recommendations and answers carry 👍/👎 (and 💾 Save / 🗑 Dismiss for opportunities).
+Each button just emits a `Feedback` or `Opportunities` command — the same the CLI
+sends — so the Meta Agent's performance tracking gets the signal regardless of
+interface.
 
 ```python
-@app.action("approve_job")
-async def on_approve(ack, body, respond):
+@app.action("fb_accept")
+async def on_accept(ack, body):
     await ack()
-    job_id = body["actions"][0]["value"]
-    await engine.submit(Approve(user=body["user"]["id"], job_id=job_id))
-    await respond(replace_original=True, text="✅ Approved — continuing.")
+    ref = body["actions"][0]["value"]
+    await engine.submit(Feedback(user=body["user"]["id"], ref=ref, verdict="accept"))
 ```
-
-Because both the button and `pa approve` produce an `Approve` command, a gate
-opened in Slack can be cleared from the CLI and vice-versa.
 
 ---
 
-## 5. The Daily Digest Delivery
+## 6. The Insight Digest Delivery
 
-Loop 1's digest is *outbound* and posts to `#daily-intelligence`. It is produced by
-the Core Engine's research loop (see
-[04-daily-research-agent.md](04-daily-research-agent.md)); the Slack adapter only
-provides a `post_digest(blocks)` sink.
+The insight digest is *outbound* and posts to `#assistant`. It is produced by the
+**Opportunity Agent**, synthesizing across the Research Agent's findings and the
+Interest Agent's model (see
+[05-meta-agent-and-skills.md §5](05-meta-agent-and-skills.md#5-the-opportunity-agent-the-value-producer));
+the Slack adapter only provides a `post_digest(blocks)` sink.
 
 ```python
 async def post_digest(blocks: list[dict]):
     await app.client.chat_postMessage(channel=DIGEST_CHANNEL, blocks=blocks)
 ```
 
-Digest Block Kit layout: a header, then one section per topic classification with
-3–5 ranked items (title, source, one-line "why it matters", link), and a footer
-with an `/ask` hint to dig deeper into anything ingested today.
+Layout: a header, one section per top interest (3–4 ranked items: title, source,
+one-line "why it matters"), an "Adjacent — worth a look" serendipity section, and a
+footer hint to `/ask` or `/brainstorm`.
 
 ---
 
-## 6. Slack App Manifest (scopes & commands)
-
-Create the app from a manifest so it's reproducible. Minimum scopes/commands:
+## 7. Slack App Manifest (scopes & commands)
 
 ```yaml
 display_information:
@@ -153,40 +187,50 @@ display_information:
 features:
   bot_user: { display_name: pa }
   slash_commands:
-    - { command: /build,    description: "Run the SDLC pipeline", usage_hint: "<idea>" }
-    - { command: /research, description: "Run research now" }
-    - { command: /digest,   description: "Show the latest digest" }
-    - { command: /ask,      description: "Query the knowledge base", usage_hint: "<question>" }
-    - { command: /status,   description: "Job status", usage_hint: "[job]" }
-    - { command: /approve,  description: "Approve a gate", usage_hint: "<job>" }
-    - { command: /cancel,   description: "Cancel a job", usage_hint: "<job>" }
-    - { command: /prefs,    description: "Manage preferences", usage_hint: "set <k> <v>" }
-    - { command: /topics,   description: "Manage tracked topics", usage_hint: "add|list|rm" }
+    - { command: /ask,        description: "Ask your knowledge base", usage_hint: "<question>" }
+    - { command: /brainstorm, description: "Start a brainstorm thread (KB + web search)" }
+    - { command: /interests,  description: "Show your interest model", usage_hint: "[timeline]" }
+    - { command: /research,   description: "Trigger the Research Agent for a topic", usage_hint: "<topic> [depth]" }
+    - { command: /graph,      description: "Show the citation/knowledge graph", usage_hint: "[knowledge|citation] [topic]" }
+    - { command: /digest,     description: "Show the latest insight digest" }
+    - { command: /opps,       description: "List/save/dismiss opportunities", usage_hint: "list|save|dismiss" }
+    - { command: /ingest,     description: "Run activity sensing now", usage_hint: "[connector]" }
+    - { command: /review,     description: "List/approve/reject Meta Agent self-modification proposals (D6)", usage_hint: "list|approve|reject <id>" }
+    - { command: /status,     description: "Job status", usage_hint: "[job]" }
+    - { command: /prefs,      description: "Manage preferences", usage_hint: "set <k> <v>" }
+    - { command: /topics,     description: "Manage tracked topics", usage_hint: "add|list|rm" }
+    - { command: /sources,    description: "Manage connectors", usage_hint: "add|list|rm" }
 oauth_config:
   scopes:
-    bot: [commands, chat:write, chat:write.public]
+    bot: [commands, chat:write, chat:write.public, channels:history, groups:history]
 settings:
   socket_mode_enabled: true
   interactivity: { is_enabled: true }
+  event_subscriptions:
+    bot_events: [message.channels, message.groups]    # for brainstorm thread replies
 ```
 
-Tokens needed: a **bot token** (`xoxb-…`) and an **app-level token** (`xapp-…`,
-scope `connections:write`) for Socket Mode. Store both in `.env`; never commit.
+> `channels:history` / `message.*` are needed for the brainstorm-thread pattern. If
+> you skip threaded brainstorm initially, drop them. Tokens: a **bot token**
+> (`xoxb-…`) and an **app-level token** (`xapp-…`, `connections:write`) in `.env`;
+> never commit.
 
 ---
 
-## 7. Parity & Testing
+## 8. Parity & Testing
 
-- **Parity:** every slash command here must map to a `Command` that the CLI also
-  exposes. The parity test in [01](01-cli-and-core-engine.md) §6 enforces it.
-- **Ack-timing test:** assert the handler calls `ack()` before `engine.submit()`
-  returns work (mock a slow engine; ack must still fire immediately).
-- **Renderer test:** feed a canned event stream to `render_to_slack` and snapshot
-  the Block Kit JSON.
+- **Parity:** every slash command maps to a `Command` the CLI also exposes — the
+  parity test in [01](01-cli-and-core-engine.md) §6 enforces it.
+- **Ack-timing test:** assert `ack()` fires before `engine.submit()` completes work
+  (mock a slow engine).
+- **Renderer test:** feed a canned event stream to `render_to_slack` and snapshot the
+  Block Kit JSON (incl. a `Message` turn with citations).
 
 ---
 
 ## Related
 - [01-cli-and-core-engine.md](01-cli-and-core-engine.md) — the contracts this adapter renders
-- [04-daily-research-agent.md](04-daily-research-agent.md) — digest producer
+- [05-meta-agent-and-skills.md](05-meta-agent-and-skills.md) — digest producer (Opportunity Agent); D6 review workflow behind `/review`
+- [06-research-agent.md](06-research-agent.md) — what `/research` triggers
+- [../personal-assistant.brainstorm-feature.md](../personal-assistant.brainstorm-feature.md) — Brainstorm design
 - [../personal-assistant.implementation.md](../personal-assistant.implementation.md)
