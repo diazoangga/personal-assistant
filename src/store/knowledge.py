@@ -2,6 +2,7 @@
 
 import aiosqlite
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -14,6 +15,12 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 logger = logging.getLogger(__name__)
+
+
+def compute_concept_id(label: str, category: str = "general") -> str:
+    """Content-addressed concept ID, stable across re-extraction of the same concept."""
+    key = f"{category}:{label.lower().strip()}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 class UnifiedKnowledgeStore:
@@ -448,6 +455,89 @@ class UnifiedKnowledgeStore:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ========== CONCEPT RELATIONSHIP / GRAPH TRAVERSAL METHODS ==========
+
+    async def add_concept_relationship(
+        self, source_id: str, target_id: str, relation_type: str, weight: float = 1.0
+    ) -> None:
+        """Insert or update a relationship edge between two concepts."""
+        cursor = await self._db.execute(
+            "SELECT id FROM concept_relationships WHERE source_id = ? AND target_id = ? AND relation_type = ?",
+            (source_id, target_id, relation_type),
+        )
+        row = await cursor.fetchone()
+        if row:
+            await self._db.execute(
+                "UPDATE concept_relationships SET weight = ? WHERE id = ?",
+                (weight, row["id"]),
+            )
+        else:
+            await self._db.execute(
+                """
+                INSERT INTO concept_relationships (source_id, target_id, relation_type, weight)
+                VALUES (?, ?, ?, ?)
+                """,
+                (source_id, target_id, relation_type, weight),
+            )
+        await self._db.commit()
+
+    async def get_concept_relationships(self, concept_id: str) -> list[dict[str, Any]]:
+        """Get all relationship edges touching a concept, in either direction."""
+        cursor = await self._db.execute(
+            "SELECT * FROM concept_relationships WHERE source_id = ? OR target_id = ?",
+            (concept_id, concept_id),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def relevant_subgraphs(
+        self,
+        seed_ids: Optional[list[str]] = None,
+        interests: Optional[list[str]] = None,
+        max_depth: int = 2,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """BFS over concept_relationships from seed concept IDs (or interest labels) up to max_depth.
+
+        Returns (nodes, edges) where nodes are concept dicts and edges are relationship dicts.
+        """
+        seeds: set[str] = set(seed_ids or [])
+        for label in interests or []:
+            for concept in await self.find_concepts_by_label(label):
+                seeds.add(concept["id"])
+
+        if not seeds:
+            return [], []
+
+        visited: set[str] = set()
+        frontier: set[str] = set(seeds)
+        edges_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        depth = 0
+        while frontier and depth <= max_depth:
+            next_frontier: set[str] = set()
+            for concept_id in frontier:
+                if concept_id in visited:
+                    continue
+                visited.add(concept_id)
+
+                for edge in await self.get_concept_relationships(concept_id):
+                    key = (edge["source_id"], edge["target_id"], edge["relation_type"])
+                    edges_by_key[key] = edge
+                    for neighbor in (edge["source_id"], edge["target_id"]):
+                        if neighbor not in visited:
+                            next_frontier.add(neighbor)
+
+            frontier = next_frontier
+            depth += 1
+
+        nodes = []
+        for concept_id in visited:
+            concept = await self.get_concept(concept_id)
+            if concept:
+                nodes.append(concept)
+
+        return nodes, list(edges_by_key.values())
 
     # ========== CITATION METHODS ==========
 

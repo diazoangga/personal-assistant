@@ -1,4 +1,14 @@
-# Personal Assistant Configuration
+# ============================================================================
+# Personal Assistant Configuration Reference
+# ============================================================================
+#
+# IMPORTANT: This file is now for REFERENCE ONLY.
+# All configuration is now environment-driven via .env
+#
+# To configure the application, copy .env.example to .env and edit values.
+# This file documents the structure and defaults for reference purposes.
+#
+# ============================================================================
 
 [general]
 name = "My AI Assistant"
@@ -6,46 +16,30 @@ timezone = "UTC"
 language = "en"
 
 [llm]
-# OpenRouter configuration
 provider = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
-# API key from environment: OPENROUTER_API_KEY
-
-# Model routing
 meta_model = "google/gemma-4-26b-a4b-it:free"
 reasoning_model = "google/gemma-4-26b-a4b-it:free"
 embedding_model = "qwen/qwen3-embedding-8b"
-
-# Rate limiting (free tier)
 rate_limit_per_minute = 60
 rate_limit_per_day = 1000
-
-# Retry settings
 max_retries = 3
 retry_base_delay = 1.0
 
 [storage]
-# Qdrant vector DB
 qdrant_host = "localhost"
 qdrant_port = 6333
 qdrant_collection = "personal-assistant-kb"
-
-# SQLite unified knowledge store (merged memory, citations, concepts)
 knowledge_db = "./data/knowledge.db"
 
 [ingest]
-# GitHub connector
 github_enabled = true
-# Token from environment: GITHUB_TOKEN
 github_poll_interval_minutes = 15
-
-# arXiv connector
 arxiv_enabled = true
 arxiv_categories = ["cs.AI", "cs.LG", "cs.CL"]
 arxiv_max_results = 50
 
 [agents]
-# Enable/disable agents
 meta_agent = true
 interest_agent = true
 research_agent = true
@@ -53,25 +47,25 @@ opportunity_agent = true
 brainstorming_agent = true
 
 [agents.interest]
-# Batch processing for question-based interest extraction
 batch_size = 5
 min_confidence = 0.6
 embedding_cache_enabled = true
 
+[agents.brainstorming]
+temperature = 0.7
+max_iterations = 5
+
 [knowledge]
-# Quality-based knowledge entry storage
 quality_threshold = 0.65
 auto_embed = false
 max_entries_per_user = 1000
 
 [conversation]
-# Session management
 session_limit = 100
 auto_create = true
 persist_across_restarts = true
 
 [topics]
-# Seed topics for interest modeling
 seed_topics = [
     "artificial intelligence",
     "machine learning",
@@ -81,29 +75,22 @@ seed_topics = [
 ]
 
 [daemon]
-# Daemon service configuration
-check_interval_seconds = 60       # How often to check for updates (60s)
-ingest_interval_minutes = 15      # How often to run full ingest cycle (15 mins)
-log_level = "INFO"                # Logging level: DEBUG, INFO, WARNING, ERROR
-log_file = "./data/daemon.log"    # Where to write daemon logs
-pid_file = "./data/daemon.pid"    # Where to store daemon PID
-state_file = "./data/daemon_state.json"  # Daemon state persistence
+check_interval_seconds = 60
+ingest_interval_minutes = 15
+log_level = "INFO"
+log_file = "./data/daemon.log"
+pid_file = "./data/daemon.pid"
+state_file = "./data/daemon_state.json"
 
 [connectors.slack]
-# Slack workspace monitoring
-enabled = false                   # Set to true to enable
-slack_token = "${SLACK_BOT_TOKEN}"  # From environment or .env
-channels = ["#general"]           # Channels to monitor (empty = all joined)
-include_dms = true                # Also monitor direct messages
+enabled = false
+channels = ["#general"]
+include_dms = true
 
 [connectors.browser]
-# Browser history monitoring
-enabled = false                   # Set to true to enable
-browsers = ["chrome", "firefox"]  # Which browsers to monitor
-track_searches = true             # Track search queries
-track_page_visits = true          # Track visited pages
-min_time_on_page = 2              # Only track pages with 2+ seconds spent
-exclude_domains = [               # Don't track these domains
-    "localhost",
-    "127.0.0.1",
-]
+enabled = false
+browsers = ["chrome", "firefox"]
+track_searches = true
+track_page_visits = true
+min_time_on_page = 2
+exclude_domains = ["localhost", "127.0.0.1"]

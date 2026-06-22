@@ -43,6 +43,7 @@ feedparser = "^6.0.0"
 python-dotenv = "^1.0.0"
 tenacity = "^8.2.0"
 einops = "^0.8.2"
+langchain-openai = "^0.2.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"

@@ -53,6 +53,10 @@ class Engine:
         self._graph = graph  # SQLite graph store
         self._llm = llm  # OpenRouter runtime
 
+    def register_agent(self, name: str, agent: Any) -> None:
+        """Register an agent (e.g. "brainstorm", "research", "opportunity") for command routing."""
+        self._agents[name] = agent
+
     async def submit(self, cmd: Command) -> str:
         """
         Submit a command for async execution.
