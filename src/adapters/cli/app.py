@@ -2,12 +2,13 @@
 
 import asyncio
 import os
-from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-import toml
 import typer
+
+# Load environment variables at module import time, before any config is read
+load_dotenv()
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -40,20 +41,165 @@ _engine: Optional[PersonalAssistantEngine] = None
 
 
 def _load_config() -> dict:
-    """Load configuration from settings.toml and .env."""
-    # Load environment variables from .env file
-    load_dotenv()
-    
-    config_path = Path(__file__).parent.parent.parent / "config" / "settings.toml"
-    
-    config = {}
-    if config_path.exists():
-        config = toml.load(config_path)
-    
-    # Merge with environment variables
-    config["openrouter_api_key"] = os.getenv("OPENROUTER_API_KEY", "")
-    config["github_token"] = os.getenv("GITHUB_TOKEN", "")
-    
+    """Load all configuration from environment variables.
+
+    All configuration is now environment-driven (.env file) for better
+    flexibility, security, and deployment across different environments.
+    Environment variables are loaded at module import time via load_dotenv().
+    """
+
+    # Helper to parse comma-separated values
+    def parse_list(env_var: str, default: list[str]) -> list[str]:
+        val = os.getenv(env_var)
+        if val:
+            return [s.strip() for s in val.split(",")]
+        return default
+
+    def parse_bool(env_var: str, default: bool = False) -> bool:
+        val = os.getenv(env_var, "").lower()
+        if val in ("true", "1", "yes", "on"):
+            return True
+        if val in ("false", "0", "no", "off"):
+            return False
+        return default
+
+    def parse_int(env_var: str, default: int) -> int:
+        try:
+            return int(os.getenv(env_var, str(default)))
+        except (ValueError, TypeError):
+            return default
+
+    def parse_float(env_var: str, default: float) -> float:
+        try:
+            return float(os.getenv(env_var, str(default)))
+        except (ValueError, TypeError):
+            return default
+
+    # Build config dict entirely from environment variables
+    config = {
+        # Top-level API keys and settings
+        "openrouter_api_key": os.getenv("OPENROUTER_API_KEY", ""),
+        "github_token": os.getenv("GITHUB_TOKEN", ""),
+        "slack_bot_token": os.getenv("SLACK_BOT_TOKEN", ""),
+        "slack_app_token": os.getenv("SLACK_APP_TOKEN", ""),
+        "tavily_api_key": os.getenv("TAVILY_API_KEY", ""),
+
+        # General settings
+        "general": {
+            "name": os.getenv("APP_NAME", "My AI Assistant"),
+            "timezone": os.getenv("APP_TIMEZONE", "UTC"),
+            "language": os.getenv("APP_LANGUAGE", "en"),
+        },
+
+        # LLM configuration
+        "llm": {
+            "provider": "openrouter",
+            "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            "meta_model": os.getenv("OPENROUTER_META_MODEL", "google/gemma-4-26b-a4b-it:free"),
+            "reasoning_model": os.getenv("OPENROUTER_REASONING_MODEL", "google/gemma-4-26b-a4b-it:free"),
+            "embedding_model": os.getenv("OPENROUTER_EMBEDDING_MODEL", "qwen/qwen3-embedding-8b"),
+            "rate_limit_per_minute": parse_int("OPENROUTER_RATE_LIMIT_PER_MINUTE", 60),
+            "rate_limit_per_day": parse_int("OPENROUTER_RATE_LIMIT_PER_DAY", 1000),
+            "max_retries": parse_int("OPENROUTER_MAX_RETRIES", 3),
+            "retry_base_delay": parse_float("OPENROUTER_RETRY_BASE_DELAY", 1.0),
+        },
+
+        # Storage configuration
+        "storage": {
+            "qdrant_host": os.getenv("QDRANT_HOST", "localhost"),
+            "qdrant_port": parse_int("QDRANT_PORT", 6333),
+            "qdrant_collection": os.getenv("QDRANT_COLLECTION", "personal-assistant-kb"),
+            "knowledge_db": os.getenv("KNOWLEDGE_DB_PATH", "./data/knowledge.db"),
+        },
+
+        # Ingest pipeline configuration
+        "ingest": {
+            "github_enabled": parse_bool("GITHUB_ENABLED", True),
+            "github_poll_interval_minutes": parse_int("GITHUB_POLL_INTERVAL_MINUTES", 15),
+            "arxiv_enabled": parse_bool("ARXIV_ENABLED", True),
+            "arxiv_categories": parse_list("ARXIV_CATEGORIES", ["cs.AI", "cs.LG", "cs.CL"]),
+            "arxiv_max_results": parse_int("ARXIV_MAX_RESULTS", 50),
+        },
+
+        # Agents configuration
+        "agents": {
+            "meta_agent": parse_bool("AGENT_META_ENABLED", True),
+            "interest_agent": parse_bool("AGENT_INTEREST_ENABLED", True),
+            "research_agent": parse_bool("AGENT_RESEARCH_ENABLED", True),
+            "opportunity_agent": parse_bool("AGENT_OPPORTUNITY_ENABLED", True),
+            "brainstorming_agent": parse_bool("AGENT_BRAINSTORMING_ENABLED", True),
+            "interest": {
+                "batch_size": parse_int("INTEREST_BATCH_SIZE", 5),
+                "min_confidence": parse_float("INTEREST_MIN_CONFIDENCE", 0.6),
+                "embedding_cache_enabled": parse_bool("INTEREST_EMBEDDING_CACHE_ENABLED", True),
+            },
+            "brainstorming": {
+                "temperature": parse_float("BRAINSTORMING_TEMPERATURE", 0.7),
+                "max_iterations": parse_int("BRAINSTORMING_MAX_ITERATIONS", 5),
+            },
+        },
+
+        # Knowledge storage configuration
+        "knowledge": {
+            "quality_threshold": parse_float("KNOWLEDGE_QUALITY_THRESHOLD", 0.65),
+            "auto_embed": parse_bool("KNOWLEDGE_AUTO_EMBED", False),
+            "max_entries_per_user": parse_int("KNOWLEDGE_MAX_ENTRIES_PER_USER", 1000),
+        },
+
+        # Conversation management
+        "conversation": {
+            "session_limit": parse_int("CONVERSATION_SESSION_LIMIT", 100),
+            "auto_create": parse_bool("CONVERSATION_AUTO_CREATE", True),
+            "persist_across_restarts": parse_bool("CONVERSATION_PERSIST_ACROSS_RESTARTS", True),
+        },
+
+        # Topics seed list
+        "topics": {
+            "seed_topics": parse_list(
+                "SEED_TOPICS",
+                [
+                    "artificial intelligence",
+                    "machine learning",
+                    "software engineering",
+                    "python",
+                    "distributed systems",
+                ],
+            ),
+        },
+
+        # Daemon service configuration
+        "daemon": {
+            "check_interval_seconds": parse_int("DAEMON_CHECK_INTERVAL_SECONDS", 60),
+            "ingest_interval_minutes": parse_int("DAEMON_INGEST_INTERVAL_MINUTES", 15),
+            "log_level": os.getenv("DAEMON_LOG_LEVEL", "INFO"),
+            "log_file": os.getenv("DAEMON_LOG_FILE", "./data/daemon.log"),
+            "pid_file": os.getenv("DAEMON_PID_FILE", "./data/daemon.pid"),
+            "state_file": os.getenv("DAEMON_STATE_FILE", "./data/daemon_state.json"),
+        },
+
+        # Connectors
+        "connectors": {
+            "slack": {
+                "enabled": parse_bool("CONNECTOR_SLACK_ENABLED", False),
+                "channels": parse_list("CONNECTOR_SLACK_CHANNELS", ["#general"]),
+                "include_dms": parse_bool("CONNECTOR_SLACK_INCLUDE_DMS", True),
+            },
+            "browser": {
+                "enabled": parse_bool("CONNECTOR_BROWSER_ENABLED", False),
+                "browsers": parse_list("CONNECTOR_BROWSER_BROWSERS", ["chrome", "firefox"]),
+                "track_searches": parse_bool("CONNECTOR_BROWSER_TRACK_SEARCHES", True),
+                "track_page_visits": parse_bool("CONNECTOR_BROWSER_TRACK_PAGE_VISITS", True),
+                "min_time_on_page": parse_int("CONNECTOR_BROWSER_MIN_TIME_ON_PAGE", 2),
+                "exclude_domains": parse_list("CONNECTOR_BROWSER_EXCLUDE_DOMAINS", ["localhost", "127.0.0.1"]),
+            },
+        },
+    }
+
+    # Override brainstorming model if explicitly set
+    brainstorming_model = os.getenv("BRAINSTORMING_MODEL")
+    if brainstorming_model:
+        config["agents"]["brainstorming"]["model"] = brainstorming_model
+
     return config
 
 
@@ -136,13 +282,72 @@ def brainstorm_cmd(topic: str = typer.Argument(..., help="Topic to brainstorm"))
 
 async def _brainstorm(topic: str) -> None:
     """Internal brainstorm implementation."""
+    import logging
+
     engine = await _get_engine()
-    
-    with console.status("[bold green]Brainstorming..."):
-        response = await engine.brainstorm(topic)
-    
-    console.print("\n[bold blue]Ideas:[/]")
-    console.print(response)
+
+    # Capture brainstorming logs for display
+    logs: list[str] = []
+
+    class BrainstormLogHandler(logging.Handler):
+        """Custom handler to capture brainstorming execution logs."""
+
+        def emit(self, record: logging.LogRecord) -> None:
+            # Capture all logs from brainstorming submodules
+            if "brainstorming" in record.name:
+                # Extract message and only include logs with [Tool] or [Node] markers
+                msg = record.getMessage()
+                if msg.startswith("["):
+                    logs.append(msg)
+
+    # Attach handler to root brainstorming logger (catches all submodules)
+    root_logger = logging.getLogger("src.agents.brainstorming")
+    root_logger.setLevel(logging.DEBUG)
+    handler = BrainstormLogHandler(level=logging.DEBUG)
+    root_logger.addHandler(handler)
+    root_logger.propagate = False  # Don't propagate to avoid duplicates
+
+    try:
+        with console.status("[bold green]Brainstorming..."):
+            response = await engine.brainstorm(topic)
+
+        # Display execution log
+        if logs:
+            console.print("\n[dim]━━━ Execution Trace ━━━[/]")
+            for log in logs:
+                if "Tool" in log or "tool" in log or "Calling" in log.lower():
+                    console.print(f"[cyan]⚙ {log}[/]")
+                elif "Registered" in log or "interest" in log.lower():
+                    console.print(f"[green]✓ {log}[/]")
+                elif "Safety" in log or "safety" in log.lower():
+                    console.print(f"[yellow]🛡 {log}[/]")
+                else:
+                    console.print(f"[dim]→ {log}[/]")
+
+        # Display execution log with color coding
+        if logs:
+            console.print("\n[dim]━━━ Execution Trace ━━━[/]")
+            for log in logs:
+                if "[Tool]" in log:
+                    console.print(f"[cyan]⚙  {log}[/]")
+                elif "[Node]" in log:
+                    if "Registered" in log or "interest" in log.lower():
+                        console.print(f"[green]✓  {log}[/]")
+                    elif "BLOCKED" in log or "Safety" in log:
+                        console.print(f"[yellow]🛡  {log}[/]")
+                    elif "accepted" in log.lower() or "ALLOWED" in log:
+                        console.print(f"[green]✓  {log}[/]")
+                    elif "needs more" in log.lower():
+                        console.print(f"[blue]↻  {log}[/]")
+                    else:
+                        console.print(f"[dim]→  {log}[/]")
+                else:
+                    console.print(f"[dim]{log}[/]")
+
+        console.print("\n[bold blue]Ideas:[/]")
+        console.print(response)
+    finally:
+        root_logger.removeHandler(handler)
 
 
 @app.command("research")

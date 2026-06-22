@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .agents.interest import InterestAgent
+from .agents.brainstorming import BrainstormingAgent
 from .core.commands import Command
 from .core.engine import Engine
 from .core.bus import EventBus
@@ -41,6 +42,7 @@ class PersonalAssistantEngine:
         self._knowledge_store: Optional[UnifiedKnowledgeStore] = None
         self._ingest: Optional[IngestPipeline] = None
         self._interest_agent: Optional[InterestAgent] = None
+        self._brainstorming_agent: Optional[BrainstormingAgent] = None
         self._question_counter: dict[str, int] = {}
         self._question_batch_buffer: dict[str, list[str]] = {}
 
@@ -80,6 +82,14 @@ class PersonalAssistantEngine:
         # Initialize Interest Agent (signal flow: classify activity -> research triggers)
         logger.debug("Initializing Interest Agent...")
         self._interest_agent = InterestAgent(engine=self._engine, llm=self._llm, memory=self._knowledge_store)
+        self._engine.register_agent("interest", self._interest_agent)
+
+        # Initialize Brainstorming Agent (LangGraph tool-calling loop with self-critique)
+        logger.debug("Initializing Brainstorming Agent...")
+        self._brainstorming_agent = BrainstormingAgent(
+            store=self._knowledge_store, llm=self._llm, config=self.config
+        )
+        self._engine.register_agent("brainstorm", self._brainstorming_agent)
 
         logger.info("PersonalAssistantEngine initialized successfully")
 
@@ -196,21 +206,12 @@ class PersonalAssistantEngine:
 
     async def brainstorm(self, topic: str, user: str = "cli") -> str:
         """Start a brainstorming session."""
-        from .core.commands import Brainstorm
-        
-        assert self._engine is not None
+        assert self._brainstorming_agent is not None
         logger.info(f"Brainstorming topic: {topic}")
-        
-        if not self._llm:
-            raise RuntimeError("LLM not initialized")
-        
-        prompt = f"Let's brainstorm about {topic}. What are some interesting angles, ideas, or considerations?"
-        response = await self._llm.chat(
-            messages=[{"role": "user", "content": prompt}],
-            model_role="meta",
-        )
-        logger.debug(f"Brainstorming completed ({len(response.content)} chars)")
-        return response.content
+
+        result = await self._brainstorming_agent.answer(topic, user_id=user)
+        logger.debug(f"Brainstorming completed ({len(result.text)} chars)")
+        return result.text
 
     async def research(self, topic: str, depth: int = 2, user: str = "cli") -> str:
         """Research a topic."""
