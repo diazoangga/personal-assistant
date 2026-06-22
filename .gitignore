@@ -198,3 +198,7 @@ docs-site/docs/plans/analisa/[0-9]*
 docs-site/docs/plans/analisa/README.md
 docs-site/docs/plans/tasks/
 docs-site/docs/.vitepress/.temp/
+
+.data/
+docs-site/.vitepress/dist/
+.mandiriaisdlc/
