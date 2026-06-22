@@ -2,6 +2,7 @@
 
 import aiosqlite
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -222,6 +223,57 @@ class UnifiedKnowledgeStore:
             )
         """)
         
+        # ===== CONVERSATION HISTORY TABLES =====
+        
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                question_count INTEGER DEFAULT 0,
+                metadata TEXT
+            )
+        """)
+        
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_number INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (session_id) REFERENCES conversation_sessions(id) ON DELETE CASCADE
+            )
+        """)
+        
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge_entries (
+                id TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                quality_score REAL DEFAULT 0.5,
+                source_session_id TEXT,
+                user_id TEXT NOT NULL,
+                embedded INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (source_session_id) REFERENCES conversation_sessions(id) ON DELETE SET NULL
+            )
+        """)
+        
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id TEXT PRIMARY KEY,
+                total_questions INTEGER DEFAULT 0,
+                total_knowledge_entries INTEGER DEFAULT 0,
+                last_active TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        
         # Create indexes for performance
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_interests_strength ON interests(strength)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_interests_label ON interests(label)")
@@ -229,6 +281,12 @@ class UnifiedKnowledgeStore:
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_citations_published ON citations(published_date)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_interest_concept ON interest_concept_links(interest_id)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_citation_concept ON citation_concept_links(citation_id)")
+        
+        # Conversation and knowledge indexes
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_conversation_sessions_user ON conversation_sessions(user_id)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_session ON conversation_turns(session_id)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_entries_user ON knowledge_entries(user_id)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_entries_quality ON knowledge_entries(quality_score DESC)")
         
         await self._db.commit()
 
@@ -645,3 +703,204 @@ class UnifiedKnowledgeStore:
             return 0.0
         
         return dot_product / (mag_a * mag_b)
+
+    # ========== CONVERSATION SESSION METHODS ==========
+
+    async def create_conversation_session(
+        self, 
+        session_id: str, 
+        user_id: str = "cli",
+        metadata: dict[str, Any] = None
+    ) -> None:
+        """Create a new conversation session."""
+        now = utcnow().isoformat()
+        await self._db.execute("""
+            INSERT INTO conversation_sessions (id, user_id, created_at, updated_at, question_count, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (session_id, user_id, now, now, 0, json.dumps(metadata) if metadata else None))
+        await self._db.commit()
+
+    async def get_or_create_session(
+        self, 
+        session_id: str, 
+        user_id: str = "cli"
+    ) -> str:
+        """Get existing session or create new one. Returns session_id."""
+        cursor = await self._db.execute(
+            "SELECT id FROM conversation_sessions WHERE id = ?",
+            (session_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await self.create_conversation_session(session_id, user_id)
+        return session_id
+
+    async def add_conversation_turn(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: dict[str, Any] = None
+    ) -> int:
+        """Add a turn to a conversation session."""
+        now = utcnow().isoformat()
+        
+        cursor = await self._db.execute(
+            "SELECT MAX(turn_number) as max_turn FROM conversation_turns WHERE session_id = ?",
+            (session_id,)
+        )
+        row = await cursor.fetchone()
+        turn_number = (row["max_turn"] or 0) + 1
+        
+        await self._db.execute("""
+            INSERT INTO conversation_turns (session_id, turn_number, role, content, timestamp, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (session_id, turn_number, role, content, now, json.dumps(metadata) if metadata else None))
+        
+        await self._db.execute("""
+            UPDATE conversation_sessions 
+            SET question_count = question_count + 1, updated_at = ?
+            WHERE id = ?
+        """, (now, session_id))
+        
+        await self._db.commit()
+        return turn_number
+
+    async def get_conversation_history(
+        self,
+        session_id: str,
+        limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Get conversation history for a session."""
+        cursor = await self._db.execute("""
+            SELECT * FROM conversation_turns 
+            WHERE session_id = ? 
+            ORDER BY turn_number DESC 
+            LIMIT ?
+        """, (session_id, limit))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    async def get_session_info(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Get session metadata."""
+        cursor = await self._db.execute(
+            "SELECT * FROM conversation_sessions WHERE id = ?",
+            (session_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def clear_conversation_history(self, session_id: str) -> None:
+        """Clear all turns from a session."""
+        await self._db.execute(
+            "DELETE FROM conversation_turns WHERE session_id = ?",
+            (session_id,)
+        )
+        await self._db.execute(
+            "UPDATE conversation_sessions SET question_count = 0, updated_at = ? WHERE id = ?",
+            (utcnow().isoformat(), session_id)
+        )
+        await self._db.commit()
+
+    # ========== USER STATISTICS METHODS ==========
+
+    async def increment_user_question_count(self, user_id: str) -> int:
+        """Increment user's question count and return new total."""
+        now = utcnow().isoformat()
+        
+        await self._db.execute("""
+            INSERT INTO user_stats (user_id, total_questions, last_active, updated_at)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                total_questions = total_questions + 1,
+                last_active = excluded.last_active,
+                updated_at = excluded.updated_at
+        """, (user_id, now, now))
+        
+        cursor = await self._db.execute(
+            "SELECT total_questions FROM user_stats WHERE user_id = ?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        await self._db.commit()
+        return row["total_questions"]
+
+    async def get_user_stats(self, user_id: str) -> Optional[dict[str, Any]]:
+        """Get statistics for a user."""
+        cursor = await self._db.execute(
+            "SELECT * FROM user_stats WHERE user_id = ?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def increment_knowledge_entries(self, user_id: str) -> None:
+        """Increment user's knowledge entry count."""
+        now = utcnow().isoformat()
+        await self._db.execute("""
+            INSERT INTO user_stats (user_id, total_knowledge_entries, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                total_knowledge_entries = total_knowledge_entries + 1,
+                updated_at = excluded.updated_at
+        """, (user_id, now))
+        await self._db.commit()
+
+    # ========== KNOWLEDGE ENTRY METHODS ==========
+
+    async def store_knowledge_entry(
+        self,
+        entry_id: str,
+        question: str,
+        answer: str,
+        quality_score: float,
+        user_id: str,
+        session_id: str = None,
+        metadata: dict[str, Any] = None
+    ) -> None:
+        """Store a high-quality Q&A pair as a knowledge entry."""
+        now = utcnow().isoformat()
+        
+        await self._db.execute("""
+            INSERT INTO knowledge_entries (id, question, answer, quality_score, source_session_id, user_id, created_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (entry_id, question, answer, quality_score, session_id, user_id, now, json.dumps(metadata) if metadata else None))
+        
+        await self.increment_knowledge_entries(user_id)
+        await self._db.commit()
+
+    async def get_knowledge_entries(
+        self,
+        user_id: str = None,
+        min_quality: float = 0.0,
+        limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Get knowledge entries filtered by user and quality."""
+        if user_id:
+            cursor = await self._db.execute("""
+                SELECT * FROM knowledge_entries 
+                WHERE user_id = ? AND quality_score >= ?
+                ORDER BY quality_score DESC, created_at DESC
+                LIMIT ?
+            """, (user_id, min_quality, limit))
+        else:
+            cursor = await self._db.execute("""
+                SELECT * FROM knowledge_entries 
+                WHERE quality_score >= ?
+                ORDER BY quality_score DESC, created_at DESC
+                LIMIT ?
+            """, (min_quality, limit))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def search_knowledge_entries(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Search knowledge entries by question/answer content."""
+        cursor = await self._db.execute("""
+            SELECT * FROM knowledge_entries 
+            WHERE question LIKE ? OR answer LIKE ?
+            ORDER BY quality_score DESC
+            LIMIT ?
+        """, (f"%{query}%", f"%{query}%", limit))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
