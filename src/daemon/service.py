@@ -209,9 +209,20 @@ class PersonalAssistantDaemon:
 
             if all_signals:
                 self.logger.info(f"Processing {len(all_signals)} signals...")
-                # TODO: Feed signals into the interest agent
-                # For now, just log them
-                self.logger.info(f"Ingest cycle: {len(all_signals)} signals processed")
+
+                research_topics = await self.engine.process_activity_signals(all_signals)
+
+                for topic in research_topics:
+                    job_id = await self.engine.submit(topic)
+                    self.logger.info(
+                        f"Research trigger submitted: '{topic.topic}' "
+                        f"(depth={topic.depth}, job_id={job_id})"
+                    )
+
+                self.logger.info(
+                    f"Ingest cycle: {len(all_signals)} signals processed, "
+                    f"{len(research_topics)} research triggers"
+                )
             else:
                 self.logger.debug("No new signals to process")
 

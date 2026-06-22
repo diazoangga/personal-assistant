@@ -4,11 +4,12 @@ import asyncio
 import logging
 from typing import Any, Optional
 
+from .agents.interest import InterestAgent
+from .core.commands import Command
 from .core.engine import Engine
 from .core.bus import EventBus
 from .store.vector import KnowledgeBase
-from .store.memory import UserMemory
-from .store.graph import CitationGraph, KnowledgeGraph
+from .store.knowledge import UnifiedKnowledgeStore
 from .ingest.pipeline import IngestPipeline
 from .llm.openrouter import OpenRouterRuntime
 
@@ -30,10 +31,9 @@ class PersonalAssistantEngine:
         self._engine: Optional[Engine] = None
         self._llm: Optional[OpenRouterRuntime] = None
         self._kb: Optional[KnowledgeBase] = None
-        self._memory: Optional[UserMemory] = None
-        self._citation_graph: Optional[CitationGraph] = None
-        self._knowledge_graph: Optional[KnowledgeGraph] = None
+        self._knowledge_store: Optional[UnifiedKnowledgeStore] = None
         self._ingest: Optional[IngestPipeline] = None
+        self._interest_agent: Optional[InterestAgent] = None
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -48,22 +48,11 @@ class PersonalAssistantEngine:
         self._kb = KnowledgeBase(config=self.config, llm=self._llm)
         await self._kb.initialize()
         
-        # Initialize memory
-        memory_db = self.config.get("memory_db", "./data/memory.db")
-        logger.debug(f"Initializing user memory (db={memory_db})...")
-        self._memory = UserMemory(memory_db)
-        await self._memory.initialize()
-        
-        # Initialize graphs
-        citation_db = self.config.get("citation_graph_db", "./data/citations.db")
-        logger.debug(f"Initializing citation graph (db={citation_db})...")
-        self._citation_graph = CitationGraph(citation_db)
-        await self._citation_graph.initialize()
-        
-        knowledge_db = self.config.get("knowledge_graph_db", "./data/concepts.db")
-        logger.debug(f"Initializing knowledge graph (db={knowledge_db})...")
-        self._knowledge_graph = KnowledgeGraph(knowledge_db)
-        await self._knowledge_graph.initialize()
+        # Initialize unified knowledge store
+        knowledge_db = self.config.get("knowledge_db", "./data/knowledge.db")
+        logger.debug(f"Initializing unified knowledge store (db={knowledge_db})...")
+        self._knowledge_store = UnifiedKnowledgeStore(knowledge_db)
+        await self._knowledge_store.initialize()
         
         # Initialize ingest pipeline
         logger.debug("Initializing ingest pipeline...")
@@ -78,22 +67,20 @@ class PersonalAssistantEngine:
             graph=self._knowledge_graph,
             ingest=self._ingest,
         )
-        
+
+        # Initialize Interest Agent (signal flow: classify activity -> research triggers)
+        logger.debug("Initializing Interest Agent...")
+        self._interest_agent = InterestAgent(engine=self._engine, llm=self._llm, memory=self._knowledge_store)
+
         logger.info("PersonalAssistantEngine initialized successfully")
 
     async def shutdown(self) -> None:
         """Clean shutdown of all components."""
         logger.info("Shutting down PersonalAssistantEngine...")
         
-        if self._memory:
-            logger.debug("Closing user memory...")
-            await self._memory.close()
-        if self._citation_graph:
-            logger.debug("Closing citation graph...")
-            await self._citation_graph.close()
-        if self._knowledge_graph:
-            logger.debug("Closing knowledge graph...")
-            await self._knowledge_graph.close()
+        if self._knowledge_store:
+            logger.debug("Closing unified knowledge store...")
+            await self._knowledge_store.close()
             
         logger.info("PersonalAssistantEngine shutdown complete")
 
@@ -102,6 +89,24 @@ class PersonalAssistantEngine:
         """Get the event bus for streaming."""
         assert self._engine is not None
         return self._engine._bus
+
+    async def submit(self, cmd: Command) -> str:
+        """Submit a command to the core engine for async execution."""
+        assert self._engine is not None
+        return await self._engine.submit(cmd)
+
+    async def process_activity_signals(
+        self, signals: list, user_id: str = "local"
+    ) -> list:
+        """
+        Run activity signals through the Interest Agent.
+
+        Returns ResearchTopic commands for topics whose interest strength
+        crossed the research trigger threshold. Caller is responsible for
+        submitting them via `submit()`.
+        """
+        assert self._interest_agent is not None
+        return await self._interest_agent.process_signals(signals, user_id=user_id)
 
     async def ask(self, query: str, user: str = "cli") -> str:
         """Ask a question and return the answer."""
@@ -173,8 +178,8 @@ class PersonalAssistantEngine:
         stats = await self._ingest.process_signals(result.signals)
         logger.info(f"GitHub ingestion complete: {stats}")
         
-        # Store activities in memory
-        if self._memory and result.signals:
+        # Store activities in knowledge store
+        if self._knowledge_store and result.signals:
             for signal in result.signals[:10]:  # Limit for now
                 # Could classify and update interests here
                 pass
@@ -183,28 +188,30 @@ class PersonalAssistantEngine:
 
     async def get_interests(self, min_strength: float = 0.0) -> list[dict[str, Any]]:
         """Get user's current interests."""
-        assert self._memory is not None
+        assert self._knowledge_store is not None
         logger.debug(f"Fetching interests (min_strength={min_strength})")
         
-        nodes = await self._memory.get_interests(min_strength=min_strength)
-        logger.debug(f"Found {len(nodes)} interests")
-        return [node.to_dict() for node in nodes]
+        interests = await self._knowledge_store.get_interests(min_strength=min_strength)
+        logger.debug(f"Found {len(interests)} interests")
+        return interests
 
     async def add_interest(self, label: str, strength: float = 0.5) -> None:
         """Manually add an interest."""
-        from .store.memory import InterestNode
         from datetime import datetime
         
-        assert self._memory is not None
+        assert self._knowledge_store is not None
         logger.info(f"Adding interest: {label} (strength={strength})")
         
-        node = InterestNode(
-            id=label.lower().replace(" ", "-"),
-            label=label,
-            strength=strength,
-            last_active=datetime.utcnow().isoformat(),
-        )
-        await self._memory.upsert_interest(node)
+        now = datetime.utcnow().isoformat()
+        interest = {
+            "id": label.lower().replace(" ", "-"),
+            "label": label,
+            "strength": strength,
+            "created_at": now,
+            "updated_at": now,
+            "last_active": now,
+        }
+        await self._knowledge_store.upsert_interest(interest)
         logger.debug(f"Interest '{label}' added successfully")
 
 

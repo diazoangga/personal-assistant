@@ -30,12 +30,8 @@ qdrant_host = "localhost"
 qdrant_port = 6333
 qdrant_collection = "personal-assistant-kb"
 
-# SQLite user memory
-memory_db = "./data/memory.db"
-
-# Graph stores
-citation_graph_db = "./data/citations.db"
-knowledge_graph_db = "./data/concepts.db"
+# SQLite unified knowledge store (merged memory, citations, concepts)
+knowledge_db = "./data/knowledge.db"
 
 [ingest]
 # GitHub connector

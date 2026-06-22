@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -229,6 +230,50 @@ class UserMemory:
             )
         """)
 
+        # Per-signal evidence backing each interest's strength (decayed sum)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS interest_signal_evidence (
+                signal_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                timestamp TEXT NOT NULL,
+                PRIMARY KEY (signal_id, topic)
+            )
+        """)
+
+        # Tracks when a topic was last sent to the Research Agent (cooldown)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS interest_research_log (
+                topic TEXT PRIMARY KEY,
+                last_researched_at TEXT NOT NULL
+            )
+        """)
+
+        # Embedding cache for interest labels (hybrid classification)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS interest_embeddings (
+                interest_id TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                model_version TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (interest_id) REFERENCES interest_nodes(id)
+            )
+        """)
+
+        # Link interests to concept nodes (unified knowledge graph)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS interest_concept_links (
+                interest_id TEXT NOT NULL,
+                concept_id TEXT NOT NULL,
+                link_type TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (interest_id, concept_id),
+                FOREIGN KEY (interest_id) REFERENCES interest_nodes(id),
+                FOREIGN KEY (concept_id) REFERENCES concept_nodes(id)
+            )
+        """)
+
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS interest_edges (
                 source_id TEXT NOT NULL,
@@ -443,6 +488,129 @@ class UserMemory:
                 )
         return nodes
 
+    async def add_classified_signal(
+        self,
+        user_id: str,
+        signal_id: str,
+        topic: str,
+        confidence: float,
+        timestamp: datetime,
+    ) -> None:
+        """Add a classified signal as evidence for a topic's interest strength."""
+        assert self._db is not None
+        now = datetime.utcnow().isoformat()
+        ts = timestamp.isoformat()
+
+        # Record the evidence (drives decayed strength calculation)
+        await self._db.execute(
+            """
+            INSERT INTO interest_signal_evidence (signal_id, topic, confidence, timestamp)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(signal_id, topic) DO UPDATE SET confidence = ?, timestamp = ?
+            """,
+            (signal_id, topic, confidence, ts, confidence, ts),
+        )
+
+        # Upsert the interest node for label/last_active bookkeeping
+        await self._db.execute(
+            """
+            INSERT INTO interest_nodes (id, label, strength, last_active, decay_rate)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET last_active = ?
+            """,
+            (topic, topic, confidence, now, 0.01, now),
+        )
+
+        await self._db.commit()
+
+    async def get_strength(
+        self, user_id: str, topic: str, decay_hours: int = 720
+    ) -> float:
+        """
+        Compute interest strength as a decayed sum of signal evidence.
+        Recent signals contribute more than old ones; clipped to [0, 1].
+        """
+        assert self._db is not None
+
+        async with self._db.execute(
+            "SELECT confidence, timestamp FROM interest_signal_evidence WHERE topic = ?",
+            (topic,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return 0.0
+
+        now = datetime.utcnow()
+        total = 0.0
+        for confidence, ts_str in rows:
+            age_hours = (now - datetime.fromisoformat(ts_str)).total_seconds() / 3600
+            total += confidence * math.exp(-age_hours / decay_hours)
+
+        return max(0.0, min(1.0, total))
+
+    async def get_strengthened_topics(
+        self, user_id: str, threshold_increase: float = 0.1, window_hours: int = 6
+    ) -> list[tuple[str, float, float]]:
+        """
+        Get topics whose strength increased since it was last cached.
+        Returns: [(topic, old_strength, new_strength), ...]
+        """
+        assert self._db is not None
+
+        topics_changed = []
+        async with self._db.execute(
+            "SELECT id, strength FROM interest_nodes ORDER BY last_active DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        for topic, old_strength in rows:
+            new_strength = await self.get_strength(user_id, topic)
+            delta = new_strength - old_strength
+            if delta >= threshold_increase:
+                topics_changed.append((topic, old_strength, new_strength))
+                await self._db.execute(
+                    "UPDATE interest_nodes SET strength = ? WHERE id = ?",
+                    (new_strength, topic),
+                )
+
+        await self._db.commit()
+        return sorted(topics_changed, key=lambda x: x[2] - x[1], reverse=True)
+
+    async def mark_researched(self, user_id: str, topic: str) -> None:
+        """Mark a topic as researched now, starting its cooldown window."""
+        assert self._db is not None
+        now = datetime.utcnow().isoformat()
+
+        await self._db.execute(
+            """
+            INSERT INTO interest_research_log (topic, last_researched_at)
+            VALUES (?, ?)
+            ON CONFLICT(topic) DO UPDATE SET last_researched_at = ?
+            """,
+            (topic, now, now),
+        )
+        await self._db.commit()
+
+    async def should_research(
+        self, user_id: str, topic: str, cooldown_hours: int = 24
+    ) -> bool:
+        """Check if enough time has passed since last research on this topic."""
+        assert self._db is not None
+
+        async with self._db.execute(
+            "SELECT last_researched_at FROM interest_research_log WHERE topic = ?",
+            (topic,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return True  # Never researched, should research
+
+        last_researched = datetime.fromisoformat(row[0])
+        age_hours = (datetime.utcnow() - last_researched).total_seconds() / 3600
+
+        return age_hours >= cooldown_hours
+
     # Opportunity operations
 
     async def add_opportunity(self, opp: Opportunity) -> None:
@@ -652,5 +820,157 @@ class UserMemory:
             WHERE id = ?
             """,
             (status, now, proposal_id),
+        )
+        await self._db.commit()
+
+    # Embedding cache operations (for hybrid classification)
+
+    async def upsert_interest_embedding(
+        self, interest_id: str, embedding: list[float], model_version: str
+    ) -> None:
+        """Store embedding for an interest label."""
+        assert self._db is not None
+        import array
+        import datetime
+        
+        now = datetime.datetime.utcnow().isoformat()
+        # Convert float list to bytes for storage
+        embedding_bytes = array.array('f', embedding).tobytes()
+        
+        await self._db.execute(
+            """
+            INSERT INTO interest_embeddings (interest_id, embedding, model_version, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(interest_id) DO UPDATE SET
+                embedding = ?,
+                model_version = ?,
+                updated_at = ?
+            """,
+            (interest_id, embedding_bytes, model_version, now, embedding_bytes, model_version, now),
+        )
+        await self._db.commit()
+
+    async def get_interest_embedding(self, interest_id: str) -> list[float] | None:
+        """Get embedding for a specific interest."""
+        assert self._db is not None
+        import array
+        
+        async with self._db.execute(
+            "SELECT embedding FROM interest_embeddings WHERE interest_id = ?",
+            (interest_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                embedding_array = array.array('f', row[0])
+                return list(embedding_array)
+            return None
+
+    async def get_interest_embeddings(
+        self, min_strength: float = 0.2
+    ) -> list[tuple[str, list[float]]]:
+        """
+        Get (interest_id, embedding) pairs for interests above strength threshold.
+        
+        Returns empty list if no embeddings are cached.
+        """
+        assert self._db is not None
+        import array
+        
+        query = """
+            SELECT e.interest_id, e.embedding
+            FROM interest_embeddings e
+            JOIN interest_nodes n ON e.interest_id = n.id
+            WHERE n.strength >= ?
+        """
+        
+        results = []
+        async with self._db.execute(query, (min_strength,)) as cursor:
+            async for row in cursor:
+                interest_id = row[0]
+                embedding_array = array.array('f', row[1])
+                embedding = list(embedding_array)
+                results.append((interest_id, embedding))
+        
+        return results
+
+    @staticmethod
+    def cosine_similarity(a: list[float], b: list[float]) -> float:
+        """Compute cosine similarity between two vectors."""
+        import math
+        
+        dot_product = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(y * y for y in b))
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        
+        return dot_product / (norm_a * norm_b)
+
+    # Interest-Concept linking operations
+
+    async def add_interest_concept_link(
+        self,
+        interest_id: str,
+        concept_id: str,
+        link_type: str,
+        confidence: float,
+    ) -> None:
+        """
+        Link an interest to a concept node.
+        
+        Args:
+            interest_id: ID of the interest
+            concept_id: ID of the concept node
+            link_type: "exact_match", "related_to", "broader", "narrower"
+            confidence: Link confidence 0.0-1.0
+        """
+        assert self._db is not None
+        now = datetime.utcnow().isoformat()
+        
+        await self._db.execute(
+            """
+            INSERT INTO interest_concept_links
+            (interest_id, concept_id, link_type, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(interest_id, concept_id) DO UPDATE SET
+                link_type = ?,
+                confidence = ?
+            """,
+            (interest_id, concept_id, link_type, confidence, now, link_type, confidence),
+        )
+        await self._db.commit()
+
+    async def get_linked_concepts(self, interest_id: str) -> list[str]:
+        """Get concept IDs linked to an interest."""
+        assert self._db is not None
+        
+        async with self._db.execute(
+            "SELECT concept_id FROM interest_concept_links WHERE interest_id = ?",
+            (interest_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def get_linked_interests(self, concept_id: str) -> list[str]:
+        """Get interest IDs linked to a concept."""
+        assert self._db is not None
+        
+        async with self._db.execute(
+            "SELECT interest_id FROM interest_concept_links WHERE concept_id = ?",
+            (concept_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def remove_interest_concept_link(
+        self, interest_id: str, concept_id: str
+    ) -> None:
+        """Remove a link between interest and concept."""
+        assert self._db is not None
+        
+        await self._db.execute(
+            "DELETE FROM interest_concept_links WHERE interest_id = ? AND concept_id = ?",
+            (interest_id, concept_id),
         )
         await self._db.commit()
