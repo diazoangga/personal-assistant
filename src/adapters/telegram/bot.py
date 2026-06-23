@@ -10,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    DefaultBotProperties,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -38,7 +39,10 @@ class TelegramBotHandler:
             engine: PersonalAssistantEngine instance
             mini_app_url: HTTPS URL to the Mini App (e.g., https://ngrok-url.ngrok.io)
         """
-        self.bot = Bot(token=bot_token, parse_mode=ParseMode.MARKDOWN)
+        self.bot = Bot(
+            token=bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+        )
         self.engine = engine
         self.mini_app_url = mini_app_url
 
