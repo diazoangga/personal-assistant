@@ -4,13 +4,13 @@ import logging
 from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    DefaultBotProperties,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
