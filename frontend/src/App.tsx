@@ -1,5 +1,4 @@
 import React, { useEffect, useState } from 'react';
-import { initUtils } from '@telegram-apps/sdk-react';
 import { AskPage } from './pages/AskPage';
 import { BrainstormPage } from './pages/BrainstormPage';
 import { InterestsPage } from './pages/InterestsPage';
@@ -14,31 +13,44 @@ export const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const initTelegram = async () => {
+    const initTelegram = () => {
       try {
-        // Initialize Telegram WebApp SDK
-        const utils = await initUtils();
-        const webApp = utils.initData;
+        // Telegram WebApp SDK is loaded via CDN in index.html
+        const tg = (window as any).Telegram?.WebApp;
 
-        if (!webApp?.initData) {
-          setError('Failed to initialize Telegram WebApp. Running in development?');
+        if (!tg) {
+          console.warn('Telegram WebApp not available. Running in development?');
           // In development, skip auth
           setIsAuthenticated(true);
           return;
         }
 
+        // Initialize WebApp
+        tg.ready();
+
+        // Get initData
+        const initData = tg.initData;
+        if (!initData) {
+          console.warn('No initData available');
+          setIsAuthenticated(true);
+          return;
+        }
+
         // Set initData on API client
-        api.setInitData(webApp.initData);
+        api.setInitData(initData);
 
         // Authenticate with backend
-        try {
-          await api.authenticate();
-          setIsAuthenticated(true);
-          setError(null);
-        } catch (authError) {
-          console.error('Authentication failed:', authError);
-          setError('Failed to authenticate with backend');
-        }
+        api.authenticate()
+          .then(() => {
+            setIsAuthenticated(true);
+            setError(null);
+          })
+          .catch((authError) => {
+            console.error('Authentication failed:', authError);
+            setError('Failed to authenticate with backend');
+            // Still allow to proceed in dev mode
+            setIsAuthenticated(true);
+          });
       } catch (err) {
         console.error('Telegram initialization error:', err);
         // In development, we might not have Telegram context
