@@ -90,18 +90,22 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("Shutting down...")
 
-        # Cancel all tasks
+        # Cancel all tasks with timeout
         for name, task in _tasks.items():
-            logger.info(f"Stopping {name}...")
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            if not task.done():
+                logger.info(f"Stopping {name}...")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    logger.warning(f"{name} did not shut down cleanly, forcing...")
 
         # Clean up engine
         if "engine" in locals():
-            await engine.shutdown()
+            try:
+                await asyncio.wait_for(engine.shutdown(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Engine shutdown timed out")
 
         logger.info("Shutdown complete")
 
