@@ -361,13 +361,62 @@ def research_cmd(
 
 async def _research(topic: str, depth: int) -> None:
     """Internal research implementation."""
+    import logging
+
     engine = await _get_engine()
-    
-    with console.status(f"[bold green]Researching (depth={depth})..."):
-        response = await engine.research(topic, depth=depth)
-    
-    console.print("\n[bold blue]Research Summary:[/]")
-    console.print(response)
+
+    # Capture research logs for display
+    logs: list[str] = []
+
+    class ResearchLogHandler(logging.Handler):
+        """Custom handler to capture research execution logs."""
+
+        def emit(self, record: logging.LogRecord) -> None:
+            # Capture logs from research agent
+            if "research" in record.name:
+                msg = record.getMessage()
+                # Include step logs and other important messages
+                if msg.startswith("[") or "✅" in msg or "❌" in msg or "=" in msg:
+                    logs.append(msg)
+
+    # Attach handler to research logger (catches all submodules)
+    root_logger = logging.getLogger("src.agents.research")
+    root_logger.setLevel(logging.INFO)
+    handler = ResearchLogHandler(level=logging.INFO)
+    root_logger.addHandler(handler)
+    root_logger.propagate = False  # Don't propagate to avoid duplicates
+
+    try:
+        with console.status(f"[bold green]Researching '{topic}' (depth={depth})..."):
+            response = await engine.research(topic, depth=depth)
+
+        # Display execution log
+        if logs:
+            console.print("\n[bold blue]Research Progress:[/]")
+            for log_line in logs:
+                # Color-code based on content
+                if "RESEARCH AGENT:" in log_line:
+                    console.print(f"[bold cyan]{log_line}[/]")
+                elif "COMPLETE" in log_line:
+                    console.print(f"[bold green]{log_line}[/]")
+                elif "FAILED" in log_line:
+                    console.print(f"[bold red]{log_line}[/]")
+                elif "=" in log_line:
+                    console.print(f"[dim]{log_line}[/]")
+                else:
+                    console.print(f"[cyan]{log_line}[/]")
+
+        console.print("\n[bold blue]Research Summary:[/]")
+        console.print(f"  📄 New papers: {response.new_papers}")
+        console.print(f"  💡 New concepts: {response.new_concepts}")
+        console.print(f"  🔗 Relationships: {response.new_edges}")
+        if response.summary:
+            console.print(f"\n[bold]Summary:[/]")
+            console.print(f"  {response.summary[:200]}{'...' if len(response.summary) > 200 else ''}")
+
+    finally:
+        # Clean up handler
+        root_logger.removeHandler(handler)
 
 
 @app.command("ingest")
