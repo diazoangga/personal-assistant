@@ -75,18 +75,26 @@ class KnowledgeBase:
         self._initialized = False
 
     async def initialize(self) -> None:
-        """Initialize the collection if it doesn't exist."""
+        """Initialize the collection if it doesn't exist. Falls back to stub mode if Qdrant unavailable."""
         logger.debug(f"Initializing KnowledgeBase at {self._base_url}/{self.collection_name}")
-        async with httpx.AsyncClient() as client:
-            # Check if collection exists
-            response = await client.get(f"{self._base_url}/collections/{self.collection_name}")
-            if response.status_code == 404:
-                logger.info(f"Creating new collection: {self.collection_name}")
-                await self._create_collection(client)
-            else:
-                logger.debug(f"Collection {self.collection_name} already exists")
-        self._initialized = True
-        logger.info("KnowledgeBase initialized successfully")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Check if collection exists
+                response = await client.get(f"{self._base_url}/collections/{self.collection_name}")
+                if response.status_code == 404:
+                    logger.info(f"Creating new collection: {self.collection_name}")
+                    await self._create_collection(client)
+                else:
+                    logger.debug(f"Collection {self.collection_name} already exists")
+            self._initialized = True
+            logger.info("KnowledgeBase initialized successfully")
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.warning(
+                f"Qdrant unavailable at {self._base_url} ({type(e).__name__}). "
+                "Running in stub mode (no semantic search). "
+                "To enable: docker run -p 6333:6333 qdrant/qdrant"
+            )
+            self._initialized = True  # Still mark as initialized to allow app to run
 
     async def _create_collection(self, client: httpx.AsyncClient) -> None:
         """Create the Qdrant collection."""
@@ -160,17 +168,21 @@ class KnowledgeBase:
         query_vector = embeddings[0]
 
         # Search Qdrant
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{self._base_url}/collections/{self.collection_name}/points/search",
-                json={
-                    "vector": query_vector,
-                    "limit": k * 2,  # Get more for reranking
-                    "with_payload": True,
-                    "score_threshold": 0.5,
-                },
-            )
-            response.raise_for_status()
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    f"{self._base_url}/collections/{self.collection_name}/points/search",
+                    json={
+                        "vector": query_vector,
+                        "limit": k * 2,  # Get more for reranking
+                        "with_payload": True,
+                        "score_threshold": 0.5,
+                    },
+                )
+                response.raise_for_status()
+        except (httpx.ConnectError, httpx.TimeoutException):
+            logger.debug(f"Qdrant unavailable, returning empty search results")
+            return []
             results = response.json()["result"]
 
         # Convert to Hits
