@@ -24,10 +24,12 @@ class InterestAgent:
     5. Emit ResearchTopic commands for new/strengthened interests
     """
 
-    def __init__(self, engine: Any, llm: Any, memory: UnifiedKnowledgeStore):
+    def __init__(self, engine: Any, llm: Any, memory: UnifiedKnowledgeStore, config: dict[str, Any] | None = None):
         self.engine = engine  # to submit ResearchTopic commands
         self.llm = llm  # to classify signals
         self.memory = memory
+        self.config = config or {}
+        self.embedding_model = self.config.get("llm", {}).get("embedding_model", "qwen/qwen3-embedding-8b")
         self.logger = logging.getLogger(__name__)
 
     async def process_signals(
@@ -148,7 +150,7 @@ class InterestAgent:
                         await self.memory.upsert_interest_embedding(
                             interest_id=matched_topics[0][0],
                             embedding=signal_embedding[0],
-                            model_version="qwen/qwen3-embedding-8b",
+                            model_version=self.embedding_model,
                         )
                 
                 else:
@@ -165,7 +167,7 @@ class InterestAgent:
                         await self.memory.upsert_interest_embedding(
                             interest_id=llm_classification.topics[0],
                             embedding=signal_embedding[0],
-                            model_version="qwen/qwen3-embedding-8b",
+                            model_version=self.embedding_model,
                         )
                         
             except Exception as e:
