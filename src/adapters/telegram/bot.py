@@ -4,6 +4,7 @@ import logging
 from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -38,7 +39,10 @@ class TelegramBotHandler:
             engine: PersonalAssistantEngine instance
             mini_app_url: HTTPS URL to the Mini App (e.g., https://ngrok-url.ngrok.io)
         """
-        self.bot = Bot(token=bot_token, parse_mode=ParseMode.MARKDOWN)
+        self.bot = Bot(
+            token=bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+        )
         self.engine = engine
         self.mini_app_url = mini_app_url
 

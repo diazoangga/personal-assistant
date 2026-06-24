@@ -210,7 +210,7 @@ class OpenRouterRuntime:
             }
 
             payload = {
-                "model": "qwen/qwen3-embedding-8b",
+                "model": self.embedding_model,
                 "input": texts,
             }
 

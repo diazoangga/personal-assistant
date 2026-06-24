@@ -25,7 +25,9 @@ export class PersonalAssistantAPI {
 
   constructor(baseURL: string = 'http://localhost:8000') {
     this.baseURL = baseURL;
-    this.webSocketUrl = baseURL.replace('http', 'ws');
+    this.webSocketUrl = baseURL
+      ? baseURL.replace('http', 'ws')
+      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
 
     this.client = axios.create({
       baseURL: `${baseURL}/api`,
@@ -49,6 +51,7 @@ export class PersonalAssistantAPI {
   private getHeaders(): Record<string, string> {
     return {
       'Content-Type': 'application/json',
+      'X-Telegram-Init-Data': this.initData,
     };
   }
 
@@ -64,11 +67,7 @@ export class PersonalAssistantAPI {
    * Authenticate with the server using initData.
    */
   async authenticate(): Promise<{ user_id: string; first_name?: string; is_premium: boolean }> {
-    const response = await this.client.post(
-      '/auth',
-      { init_data: this.initData },
-      { headers: this.getHeaders() }
-    );
+    const response = await this.client.post('/auth', {}, { headers: this.getHeaders() });
     return response.data;
   }
 
@@ -193,9 +192,13 @@ export class PersonalAssistantAPI {
 
     let resolve: ((value: EventUpdate) => void) | null = null;
     let reject: ((reason?: any) => void) | null = null;
+    let closed = false;
 
-    ws.addEventListener('open', () => {
-      console.log(`WebSocket connected for job ${jobId}`);
+    // readyState is CONNECTING (not OPEN) immediately after `new WebSocket()`
+    // since opening is async - wait for the 'open' event before streaming.
+    const opened = new Promise<void>((res, rej) => {
+      ws.addEventListener('open', () => res());
+      ws.addEventListener('error', (e) => rej(e));
     });
 
     ws.addEventListener('message', (event) => {
@@ -223,10 +226,16 @@ export class PersonalAssistantAPI {
 
     ws.addEventListener('close', () => {
       console.log(`WebSocket closed for job ${jobId}`);
+      closed = true;
+      if (reject) {
+        reject(new Error('WebSocket closed'));
+        reject = null;
+      }
     });
 
     try {
-      while (ws.readyState === WebSocket.OPEN) {
+      await opened;
+      while (!closed) {
         const promise = new Promise<EventUpdate>((res, rej) => {
           resolve = res;
           reject = rej;
@@ -240,7 +249,11 @@ export class PersonalAssistantAPI {
   }
 }
 
-// Export a singleton instance
+// Export a singleton instance.
+// VITE_API_URL='' (empty string, not unset) means "same origin" — requests go
+// through Vite's dev proxy instead of crossing to a separate localhost:8000
+// origin, which avoids Chrome's Local Network Access block when the page is
+// loaded through a public tunnel (e.g. ngrok).
 export const api = new PersonalAssistantAPI(
-  process.env.REACT_APP_API_URL || 'http://localhost:8000'
+  import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 );

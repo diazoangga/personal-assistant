@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from uvicorn import Server, Config
 
 from ...daemon.service import PersonalAssistantDaemon
@@ -40,6 +41,22 @@ if not TELEGRAM_BOT_TOKEN:
 
 # Global task handles
 _tasks: dict[str, asyncio.Task] = {}
+
+
+class PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
+    """Answer Chrome's Private Network Access preflight check.
+
+    When the Mini App is served from a public origin (e.g. an ngrok tunnel)
+    but calls a loopback API (localhost), Chrome requires the response to
+    echo back Access-Control-Allow-Private-Network or it blocks the request
+    as a CORS failure before it ever reaches the route handler.
+    """
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.headers.get("access-control-request-private-network") == "true":
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
 
 
 @asynccontextmanager
@@ -90,18 +107,22 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("Shutting down...")
 
-        # Cancel all tasks
+        # Cancel all tasks with timeout
         for name, task in _tasks.items():
-            logger.info(f"Stopping {name}...")
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            if not task.done():
+                logger.info(f"Stopping {name}...")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    logger.warning(f"{name} did not shut down cleanly, forcing...")
 
         # Clean up engine
         if "engine" in locals():
-            await engine.shutdown()
+            try:
+                await asyncio.wait_for(engine.shutdown(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Engine shutdown timed out")
 
         logger.info("Shutdown complete")
 
@@ -123,6 +144,9 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Must be added after CORSMiddleware so it wraps outside it and can see
+    # (and patch) the preflight response CORSMiddleware short-circuits with.
+    app.add_middleware(PrivateNetworkAccessMiddleware)
 
     # Include API routes
     app.include_router(router)
