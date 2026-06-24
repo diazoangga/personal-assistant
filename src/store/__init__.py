@@ -1,4 +1,4 @@
-"""Storage layer - vector DB, memory, and graph stores."""
+"""Storage layer - vector DB, memory, and knowledge stores."""
 
 from .vector import KnowledgeBase, Chunk, Hit
 from .memory import (
@@ -8,13 +8,6 @@ from .memory import (
     Opportunity,
     Feedback,
     Proposal,
-)
-from .graph import (
-    CitationGraph,
-    KnowledgeGraph,
-    CitationNode,
-    ConceptNode,
-    RelationEdge,
 )
 
 __all__ = [
@@ -29,10 +22,4 @@ __all__ = [
     "Opportunity",
     "Feedback",
     "Proposal",
-    # Graph
-    "CitationGraph",
-    "KnowledgeGraph",
-    "CitationNode",
-    "ConceptNode",
-    "RelationEdge",
 ]

@@ -10,7 +10,6 @@ import pytest
 
 from src.store.vector import KnowledgeBase, Chunk, Hit, semantic_chunks
 from src.store.memory import UserMemory, InterestNode, InterestEdge, Opportunity, Feedback, Proposal
-from src.store.graph import CitationGraph, KnowledgeGraph, CitationNode, ConceptNode, RelationEdge
 
 
 # Fixtures
@@ -31,24 +30,6 @@ async def user_memory(temp_db):
     await memory.initialize()
     yield memory
     await memory.close()
-
-
-@pytest.fixture
-async def citation_graph(temp_db):
-    """Create a CitationGraph instance."""
-    graph = CitationGraph(temp_db)
-    await graph.initialize()
-    yield graph
-    await graph.close()
-
-
-@pytest.fixture
-async def knowledge_graph(temp_db):
-    """Create a KnowledgeGraph instance."""
-    graph = KnowledgeGraph(temp_db)
-    await graph.initialize()
-    yield graph
-    await graph.close()
 
 
 # Vector Store Tests
@@ -368,134 +349,3 @@ class TestUserMemory:
 
         proposals = await user_memory.get_pending_proposals()
         assert len(proposals) == 0  # No longer pending
-
-
-# Citation Graph Tests
-class TestCitationGraph:
-    """Test CitationGraph class."""
-
-    @pytest.mark.asyncio
-    async def test_add_paper(self, citation_graph):
-        """Test adding a paper."""
-        paper = CitationNode(
-            id="arxiv:1234.5678",
-            title="Test Paper",
-            authors=["Author A", "Author B"],
-            venue="Test Conference",
-            year=2024,
-            abstract="Test abstract",
-            url="https://arxiv.org/1234.5678",
-        )
-        await citation_graph.add_paper(paper)
-
-        retrieved = await citation_graph.get_paper("arxiv:1234.5678")
-        assert retrieved is not None
-        assert retrieved.title == "Test Paper"
-
-    @pytest.mark.asyncio
-    async def test_get_nonexistent_paper(self, citation_graph):
-        """Test getting nonexistent paper."""
-        paper = await citation_graph.get_paper("nonexistent")
-        assert paper is None
-
-    @pytest.mark.asyncio
-    async def test_citation_chain(self, citation_graph):
-        """Test citation chain retrieval."""
-        # Add papers with citations
-        paper1 = CitationNode(id="p1", title="Paper 1", authors=[], venue=None, year=2024, abstract="", url=None)
-        paper2 = CitationNode(id="p2", title="Paper 2", authors=[], venue=None, year=2024, abstract="", url=None, references=["p1"])
-        paper3 = CitationNode(id="p3", title="Paper 3", authors=[], venue=None, year=2024, abstract="", url=None, cited_by=["p2"])
-
-        paper1.cited_by = ["p2"]
-        paper2.references = ["p1"]
-        paper2.cited_by = ["p3"]
-        paper3.references = ["p2"]
-
-        await citation_graph.add_paper(paper1)
-        await citation_graph.add_paper(paper2)
-        await citation_graph.add_paper(paper3)
-
-        chain = await citation_graph.citation_chain("p2", depth=1)
-        assert len(chain) > 0
-
-    @pytest.mark.asyncio
-    async def test_is_novel_exact_match(self, citation_graph):
-        """Test novelty detection with exact title match."""
-        paper1 = CitationNode(id="p1", title="Unique Title", authors=[], venue=None, year=2024, abstract="", url=None)
-        await citation_graph.add_paper(paper1)
-
-        paper2 = CitationNode(id="p2", title="Unique Title", authors=[], venue=None, year=2025, abstract="", url=None)
-        is_novel = await citation_graph.is_novel(paper2)
-        assert not is_novel  # Not novel due to exact match
-
-    @pytest.mark.asyncio
-    async def test_is_novel_no_match(self, citation_graph):
-        """Test novelty detection with no match."""
-        paper = CitationNode(id="p1", title="Completely New Title", authors=[], venue=None, year=2024, abstract="", url=None)
-        is_novel = await citation_graph.is_novel(paper)
-        assert is_novel  # Should be novel
-
-
-# Knowledge Graph Tests
-class TestKnowledgeGraph:
-    """Test KnowledgeGraph class."""
-
-    @pytest.mark.asyncio
-    async def test_add_concept(self, knowledge_graph):
-        """Test adding a concept."""
-        concept = ConceptNode(
-            id="transformer",
-            label="Transformer",
-            category="method",
-            description="Attention-based architecture",
-            aliases=["attention model", "transformer network"],
-        )
-        await knowledge_graph.add_concept(concept)
-
-        retrieved = await knowledge_graph.get_concept("transformer")
-        assert retrieved is not None
-        assert retrieved.label == "Transformer"
-
-    @pytest.mark.asyncio
-    async def test_add_relation(self, knowledge_graph):
-        """Test adding relations."""
-        # Add concepts
-        c1 = ConceptNode(id="cnn", label="CNN", category="method", description="")
-        c2 = ConceptNode(id="cv", label="Computer Vision", category="domain", description="")
-        await knowledge_graph.add_concept(c1)
-        await knowledge_graph.add_concept(c2)
-
-        # Add relation
-        edge = RelationEdge(
-            source_id="cnn",
-            target_id="cv",
-            relation_type="used_for",
-            confidence=0.95,
-            evidence=["paper-1"],
-        )
-        await knowledge_graph.add_relation(edge)
-
-        # Get subgraph
-        nodes, edges = await knowledge_graph.relevant_subgraphs(["cnn"], max_depth=1)
-        assert len(nodes) >= 1
-        assert len(edges) >= 1
-
-    @pytest.mark.asyncio
-    async def test_find_concept_by_label(self, knowledge_graph):
-        """Test finding concept by label."""
-        concept = ConceptNode(id="rl", label="Reinforcement Learning", category="method", description="")
-        await knowledge_graph.add_concept(concept)
-
-        found = await knowledge_graph.find_concept_by_label("Reinforcement Learning")
-        assert found is not None
-        assert found.id == "rl"
-
-    @pytest.mark.asyncio
-    async def test_compute_concept_id(self):
-        """Test concept ID computation."""
-        id1 = KnowledgeGraph.compute_concept_id("Transformers", "method")
-        id2 = KnowledgeGraph.compute_concept_id("Transformers", "method")
-        id3 = KnowledgeGraph.compute_concept_id("transformers", "method")
-
-        assert id1 == id2  # Same input produces same ID
-        assert id1 != id3  # Different case produces different ID (by design)

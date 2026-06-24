@@ -23,6 +23,21 @@ def compute_concept_id(label: str, category: str = "general") -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+def compute_citation_id(citation: dict[str, Any]) -> str:
+    """Content-addressed citation ID: doi > arxiv_id > semantic_scholar_id > title hash.
+
+    This priority only matters for a brand-new paper; `_resolve_citation_id` checks
+    existing rows by any of the three identifiers first, so a paper rediscovered via a
+    second source backfills the existing row instead of minting a duplicate.
+    """
+    for field, prefix in (("doi", "doi"), ("arxiv_id", "arxiv"), ("semantic_scholar_id", "s2")):
+        value = (citation.get(field) or "").strip().lower()
+        if value:
+            return f"{prefix}:{hashlib.sha256(value.encode()).hexdigest()[:16]}"
+    title = (citation.get("title") or "").strip().lower()
+    return f"title:{hashlib.sha256(title.encode()).hexdigest()[:16]}"
+
+
 class UnifiedKnowledgeStore:
     """
     Unified SQLite knowledge store that consolidates:
@@ -56,9 +71,53 @@ class UnifiedKnowledgeStore:
         
         logger.info("Unified knowledge store initialized successfully")
 
+    async def _add_column_if_missing(self, table: str, column: str, ddl: str) -> None:
+        """Idempotently add a column to an existing table (additive migration)."""
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        existing = {row["name"] for row in rows}
+        if column not in existing:
+            await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+    async def _migrate_citation_relationships(self) -> None:
+        """Recreate citation_relationships with a UNIQUE edge constraint if it predates one.
+
+        The table previously had no UNIQUE(source_id, target_id, relationship_type), so
+        re-research would duplicate edges. SQLite can't ALTER a UNIQUE constraint in, so an
+        old-shape table is renamed, recreated, and its rows are copied over (deduplicated).
+        """
+        cursor = await self._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='citation_relationships'"
+        )
+        row = await cursor.fetchone()
+        if row is None or "UNIQUE" in (row["sql"] or ""):
+            return  # doesn't exist yet, or already migrated
+
+        await self._db.execute(
+            "ALTER TABLE citation_relationships RENAME TO citation_relationships_old"
+        )
+        await self._db.execute("""
+            CREATE TABLE citation_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relationship_type TEXT NOT NULL DEFAULT 'cites',
+                UNIQUE(source_id, target_id, relationship_type),
+                FOREIGN KEY (source_id) REFERENCES citations(id),
+                FOREIGN KEY (target_id) REFERENCES citations(id)
+            )
+        """)
+        await self._db.execute("""
+            INSERT OR IGNORE INTO citation_relationships (source_id, target_id, relationship_type)
+            SELECT source_id, target_id, COALESCE(relationship_type, 'cites')
+            FROM citation_relationships_old
+        """)
+        await self._db.execute("DROP TABLE citation_relationships_old")
+        await self._db.commit()
+
     async def _create_tables(self) -> None:
         """Create all unified schema tables."""
-        
+
         # ===== USER MEMORY TABLES =====
         
         await self._db.execute("""
@@ -151,20 +210,39 @@ class UnifiedKnowledgeStore:
                 created_at TEXT NOT NULL
             )
         """)
-        
+
+        # Citation-graph node enrichment (research-agent.data-model.md §4.1)
+        await self._add_column_if_missing("citations", "semantic_scholar_id", "semantic_scholar_id TEXT")
+        await self._add_column_if_missing("citations", "url", "url TEXT")
+        await self._add_column_if_missing("citations", "tldr", "tldr TEXT")
+        await self._add_column_if_missing("citations", "conclusion", "conclusion TEXT")
+        await self._add_column_if_missing("citations", "notes", "notes TEXT")
+        await self._add_column_if_missing("citations", "year", "year INTEGER")
+        await self._add_column_if_missing("citations", "venue", "venue TEXT")
+        await self._add_column_if_missing("citations", "reference_count", "reference_count INTEGER DEFAULT 0")
+        await self._add_column_if_missing(
+            "citations", "influential_citation_count", "influential_citation_count INTEGER DEFAULT 0"
+        )
+        await self._add_column_if_missing("citations", "source", "source TEXT")
+        await self._add_column_if_missing("citations", "last_researched_at", "last_researched_at TEXT")
+        await self._add_column_if_missing("citations", "embedding_cached", "embedding_cached INTEGER DEFAULT 0")
+
+        # Recreate citation_relationships with a UNIQUE edge constraint if it predates one.
+        await self._migrate_citation_relationships()
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS citation_relationships (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id TEXT NOT NULL,
                 target_id TEXT NOT NULL,
-                relationship_type TEXT,
+                relationship_type TEXT NOT NULL DEFAULT 'cites',
+                UNIQUE(source_id, target_id, relationship_type),
                 FOREIGN KEY (source_id) REFERENCES citations(id),
                 FOREIGN KEY (target_id) REFERENCES citations(id)
             )
         """)
-        
+
         # ===== KNOWLEDGE GRAPH TABLES =====
-        
+
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS concepts (
                 id TEXT PRIMARY KEY,
@@ -174,6 +252,8 @@ class UnifiedKnowledgeStore:
                 created_at TEXT NOT NULL
             )
         """)
+        await self._add_column_if_missing("concepts", "mention_count", "mention_count INTEGER DEFAULT 0")
+        await self._add_column_if_missing("concepts", "first_seen_run_id", "first_seen_run_id TEXT")
         
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS concept_relationships (
@@ -217,6 +297,41 @@ class UnifiedKnowledgeStore:
             )
         """)
         
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS interest_citation_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interest_id TEXT NOT NULL,
+                citation_id TEXT NOT NULL,
+                relevance REAL DEFAULT 0.5,
+                discovered_run_id TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (interest_id) REFERENCES interests(id) ON DELETE CASCADE,
+                FOREIGN KEY (citation_id) REFERENCES citations(id) ON DELETE CASCADE,
+                UNIQUE(interest_id, citation_id)
+            )
+        """)
+
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS research_runs (
+                id TEXT PRIMARY KEY,
+                topic TEXT NOT NULL,
+                interest_id TEXT,
+                trigger_source TEXT NOT NULL,
+                depth TEXT NOT NULL,
+                status TEXT NOT NULL,
+                papers_found INTEGER DEFAULT 0,
+                papers_new INTEGER DEFAULT 0,
+                concepts_extracted INTEGER DEFAULT 0,
+                concepts_new INTEGER DEFAULT 0,
+                relationships_found INTEGER DEFAULT 0,
+                summary TEXT,
+                error TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (interest_id) REFERENCES interests(id) ON DELETE SET NULL
+            )
+        """)
+
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS opportunity_interest_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -288,7 +403,12 @@ class UnifiedKnowledgeStore:
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_citations_published ON citations(published_date)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_interest_concept ON interest_concept_links(interest_id)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_citation_concept ON citation_concept_links(citation_id)")
-        
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_citation_rel_source ON citation_relationships(source_id)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_citation_rel_target ON citation_relationships(target_id)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_interest_citation ON interest_citation_links(interest_id)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_research_runs_topic ON research_runs(topic)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_research_runs_interest ON research_runs(interest_id)")
+
         # Conversation and knowledge indexes
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_conversation_sessions_user ON conversation_sessions(user_id)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_session ON conversation_turns(session_id)")
@@ -541,36 +661,90 @@ class UnifiedKnowledgeStore:
 
     # ========== CITATION METHODS ==========
 
-    async def upsert_citation(self, citation: dict[str, Any]) -> None:
-        """Insert or update a citation."""
+    async def _resolve_citation_id(self, citation: dict[str, Any]) -> str:
+        """Find an existing citation by any cross-source identifier before minting a new ID.
+
+        Each source (Semantic Scholar, arXiv) may only populate one of doi/arxiv_id/
+        semantic_scholar_id; checking all three against existing rows is what lets a paper
+        rediscovered via a second source update its existing row instead of duplicating it.
+        """
+        for field in ("doi", "arxiv_id", "semantic_scholar_id"):
+            value = citation.get(field)
+            if value:
+                cursor = await self._db.execute(f"SELECT id FROM citations WHERE {field} = ?", (value,))
+                row = await cursor.fetchone()
+                if row:
+                    return row["id"]
+        return compute_citation_id(citation)
+
+    async def upsert_citation(self, citation: dict[str, Any]) -> str:
+        """Insert or update a citation. Returns the resolved citation_id.
+
+        If `citation["id"]` is given explicitly, it's used as-is (caller already decided
+        identity, e.g. brainstorming's web-search registrations). Otherwise identity is
+        resolved via `_resolve_citation_id` so re-research backfills rather than duplicates.
+        """
         now = utcnow().isoformat()
-        
+        citation_id = citation.get("id") or await self._resolve_citation_id(citation)
+        notes = citation.get("notes")
+        notes_json = json.dumps(notes) if isinstance(notes, dict) else notes
+
         await self._db.execute("""
-            INSERT INTO citations (id, arxiv_id, doi, title, abstract, authors, 
-                                   published_date, journal, categories, citation_count, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO citations (
+                id, arxiv_id, doi, semantic_scholar_id, title, abstract, authors,
+                published_date, journal, venue, year, categories, citation_count,
+                reference_count, influential_citation_count, url, tldr, conclusion,
+                notes, source, last_researched_at, embedding_cached, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                arxiv_id = COALESCE(excluded.arxiv_id, citations.arxiv_id),
+                doi = COALESCE(excluded.doi, citations.doi),
+                semantic_scholar_id = COALESCE(excluded.semantic_scholar_id, citations.semantic_scholar_id),
                 title = excluded.title,
-                abstract = excluded.abstract,
-                authors = excluded.authors,
-                published_date = excluded.published_date,
-                journal = excluded.journal,
-                categories = excluded.categories,
-                citation_count = excluded.citation_count
+                abstract = COALESCE(excluded.abstract, citations.abstract),
+                authors = COALESCE(excluded.authors, citations.authors),
+                published_date = COALESCE(excluded.published_date, citations.published_date),
+                journal = COALESCE(excluded.journal, citations.journal),
+                venue = COALESCE(excluded.venue, citations.venue),
+                year = COALESCE(excluded.year, citations.year),
+                categories = COALESCE(excluded.categories, citations.categories),
+                citation_count = excluded.citation_count,
+                reference_count = excluded.reference_count,
+                influential_citation_count = excluded.influential_citation_count,
+                url = COALESCE(excluded.url, citations.url),
+                tldr = COALESCE(excluded.tldr, citations.tldr),
+                conclusion = COALESCE(excluded.conclusion, citations.conclusion),
+                notes = COALESCE(excluded.notes, citations.notes),
+                source = COALESCE(excluded.source, citations.source),
+                last_researched_at = COALESCE(excluded.last_researched_at, citations.last_researched_at)
         """, (
-            citation.get("id"),
+            citation_id,
             citation.get("arxiv_id"),
             citation.get("doi"),
+            citation.get("semantic_scholar_id"),
             citation.get("title"),
             citation.get("abstract"),
             citation.get("authors"),  # JSON string
             citation.get("published_date"),
             citation.get("journal"),
+            citation.get("venue"),
+            citation.get("year"),
             citation.get("categories"),  # JSON string
             citation.get("citation_count", 0),
+            citation.get("reference_count", 0),
+            citation.get("influential_citation_count", 0),
+            citation.get("url"),
+            citation.get("tldr"),
+            citation.get("conclusion"),
+            notes_json,
+            citation.get("source"),
+            citation.get("last_researched_at"),
+            citation.get("embedding_cached", 0),
             now,
         ))
         await self._db.commit()
+        return citation_id
 
     async def get_citation(self, citation_id: str) -> Optional[dict[str, Any]]:
         """Get a citation by ID."""
@@ -586,6 +760,93 @@ class UnifiedKnowledgeStore:
         cursor = await self._db.execute("SELECT * FROM citations ORDER BY published_date DESC")
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    async def find_citations_by_title(self, pattern: str) -> list[dict[str, Any]]:
+        """Find citations with a title matching pattern (SQL LIKE) — fallback lookup
+        when a topic has no linked interest to query through."""
+        cursor = await self._db.execute(
+            "SELECT * FROM citations WHERE title LIKE ?",
+            (f"%{pattern}%",),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def update_citation_notes(
+        self, citation_id: str, *, conclusion: Optional[str] = None, notes: Optional[dict[str, Any]] = None
+    ) -> None:
+        """Update the LLM-synthesized conclusion and/or structured notes for a citation."""
+        notes_json = json.dumps(notes) if notes is not None else None
+        await self._db.execute(
+            "UPDATE citations SET conclusion = COALESCE(?, conclusion), notes = COALESCE(?, notes) WHERE id = ?",
+            (conclusion, notes_json, citation_id),
+        )
+        await self._db.commit()
+
+    async def is_known_citation(self, citation_id: str) -> bool:
+        """Whether a citation already exists — the novelty gate for citation-chase BFS."""
+        cursor = await self._db.execute("SELECT 1 FROM citations WHERE id = ?", (citation_id,))
+        return (await cursor.fetchone()) is not None
+
+    # ========== CITATION GRAPH (cites edges) ==========
+
+    async def add_citation_edge(self, source_id: str, target_id: str, relationship_type: str = "cites") -> None:
+        """Insert a directed citation edge (source cites target). Idempotent: a second
+        sighting of the same edge is a no-op rather than a duplicate row."""
+        await self._db.execute(
+            """
+            INSERT INTO citation_relationships (source_id, target_id, relationship_type)
+            VALUES (?, ?, ?)
+            ON CONFLICT(source_id, target_id, relationship_type) DO NOTHING
+            """,
+            (source_id, target_id, relationship_type),
+        )
+        await self._db.commit()
+
+    async def get_citation_edges(self, citation_id: str) -> list[dict[str, Any]]:
+        """Get all citation edges touching a paper, in either direction (cites / cited-by)."""
+        cursor = await self._db.execute(
+            "SELECT * FROM citation_relationships WHERE source_id = ? OR target_id = ?",
+            (citation_id, citation_id),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def citation_subgraph(
+        self, seed_ids: list[str], max_depth: int = 2
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """BFS over citation_relationships from seed paper IDs up to max_depth.
+
+        Returns (nodes, edges) as plain dict lists — the litmaps-style export shape.
+        """
+        visited: set[str] = set()
+        frontier: set[str] = set(seed_ids or [])
+        edges_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        depth = 0
+        while frontier and depth <= max_depth:
+            next_frontier: set[str] = set()
+            for citation_id in frontier:
+                if citation_id in visited:
+                    continue
+                visited.add(citation_id)
+
+                for edge in await self.get_citation_edges(citation_id):
+                    key = (edge["source_id"], edge["target_id"], edge["relationship_type"])
+                    edges_by_key[key] = edge
+                    for neighbor in (edge["source_id"], edge["target_id"]):
+                        if neighbor not in visited:
+                            next_frontier.add(neighbor)
+
+            frontier = next_frontier
+            depth += 1
+
+        nodes = []
+        for citation_id in visited:
+            node = await self.get_citation(citation_id)
+            if node:
+                nodes.append(node)
+
+        return nodes, list(edges_by_key.values())
 
     # ========== LINKING METHODS ==========
 
@@ -666,12 +927,126 @@ class UnifiedKnowledgeStore:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def link_interest_to_citation(
+        self,
+        interest_id: str,
+        citation_id: str,
+        relevance: float = 0.5,
+        discovered_run_id: Optional[str] = None,
+    ) -> None:
+        """Create a link between an interest and a citation (G6: research → interest)."""
+        now = utcnow().isoformat()
+
+        await self._db.execute("""
+            INSERT INTO interest_citation_links (interest_id, citation_id, relevance, discovered_run_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(interest_id, citation_id) DO UPDATE SET
+                relevance = excluded.relevance
+        """, (interest_id, citation_id, relevance, discovered_run_id, now))
+        await self._db.commit()
+
+    async def get_citations_for_interest(self, interest_id: str) -> list[dict[str, Any]]:
+        """Get all citations linked to an interest, most relevant first."""
+        cursor = await self._db.execute("""
+            SELECT c.*, icl.relevance, icl.discovered_run_id
+            FROM citations c
+            JOIN interest_citation_links icl ON c.id = icl.citation_id
+            WHERE icl.interest_id = ?
+            ORDER BY icl.relevance DESC
+        """, (interest_id,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_existing_research(
+        self, topic: str, interest_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        """What we already know about a topic, for reuse (G6) — prior runs, papers, concepts.
+
+        When `interest_id` is given, looks through the precise interest link tables;
+        otherwise falls back to a title/label match on `topic`.
+        """
+        runs = await self.get_research_runs(topic=topic, interest_id=interest_id)
+        if interest_id:
+            citations = await self.get_citations_for_interest(interest_id)
+            concepts = await self.get_linked_concepts_for_interest(interest_id)
+        else:
+            citations = await self.find_citations_by_title(topic)
+            concepts = await self.find_concepts_by_label(topic)
+        return {"runs": runs, "citations": citations, "concepts": concepts}
+
+    # ========== RESEARCH RUN PROVENANCE METHODS ==========
+
+    async def start_research_run(self, run: dict[str, Any]) -> str:
+        """Record the start of a research run. Returns the run_id."""
+        import uuid
+
+        run_id = run.get("id") or uuid.uuid4().hex
+        now = utcnow().isoformat()
+
+        await self._db.execute("""
+            INSERT INTO research_runs (id, topic, interest_id, trigger_source, depth, status, started_at)
+            VALUES (?, ?, ?, ?, ?, 'running', ?)
+        """, (
+            run_id,
+            run["topic"],
+            run.get("interest_id"),
+            run.get("trigger_source", "manual"),
+            run.get("depth", "normal"),
+            now,
+        ))
+        await self._db.commit()
+        return run_id
+
+    async def finish_research_run(self, run_id: str, *, status: str = "completed", **fields: Any) -> None:
+        """Mark a research run finished, recording its deltas/summary/error."""
+        allowed = {
+            "papers_found", "papers_new", "concepts_extracted", "concepts_new",
+            "relationships_found", "summary", "error",
+        }
+        set_clauses = ["status = ?", "completed_at = ?"]
+        params: list[Any] = [status, utcnow().isoformat()]
+        for key, value in fields.items():
+            if key in allowed:
+                set_clauses.append(f"{key} = ?")
+                params.append(value)
+        params.append(run_id)
+
+        await self._db.execute(
+            f"UPDATE research_runs SET {', '.join(set_clauses)} WHERE id = ?", params
+        )
+        await self._db.commit()
+
+    async def get_research_runs(
+        self, topic: Optional[str] = None, interest_id: Optional[str] = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """List research runs, most recent first, optionally filtered by topic/interest."""
+        conditions = []
+        params: list[Any] = []
+        if topic:
+            conditions.append("topic = ?")
+            params.append(topic)
+        if interest_id:
+            conditions.append("interest_id = ?")
+            params.append(interest_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+
+        cursor = await self._db.execute(
+            f"SELECT * FROM research_runs {where} ORDER BY started_at DESC LIMIT ?", params
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     # ========== UTILITY METHODS ==========
 
     async def get_stats(self) -> dict[str, int]:
         """Get counts of all entities."""
-        tables = ["interests", "concepts", "citations", 
-                  "interest_concept_links", "citation_concept_links"]
+        tables = [
+            "interests", "concepts", "citations",
+            "interest_concept_links", "citation_concept_links",
+            "citation_relationships", "concept_relationships",
+            "interest_citation_links", "research_runs",
+        ]
         stats = {}
         
         for table in tables:
