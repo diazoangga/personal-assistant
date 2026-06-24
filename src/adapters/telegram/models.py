@@ -6,12 +6,6 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
-class TelegramInitData(BaseModel):
-    """Telegram Mini App initData payload."""
-
-    init_data: str = Field(..., description="Raw initData from Telegram WebApp")
-
-
 # Command Request Models
 class AskRequest(BaseModel):
     """Request to ask a question."""
