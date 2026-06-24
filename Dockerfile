@@ -1,23 +1,7 @@
-# Multi-stage build: React frontend + Python backend
+# Backend-only image: engine + daemon + local web API.
+# The frontend is now a separate Tauri desktop app (personal-assistant-desktop
+# repo) and is NOT built or served here.
 
-# Stage 1: Build React frontend
-FROM node:20-alpine AS frontend-builder
-
-WORKDIR /app/frontend
-
-# Copy frontend code
-COPY frontend/package.json frontend/package-lock.json* frontend/yarn.lock* ./
-
-# Install dependencies
-RUN npm ci || yarn install --frozen-lockfile || npm install
-
-# Copy source
-COPY frontend/ .
-
-# Build
-RUN npm run build
-
-# Stage 2: Python backend with static frontend
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -40,18 +24,16 @@ RUN poetry install --no-dev --no-interaction --no-ansi
 COPY src/ ./src/
 COPY config/ ./config/
 
-# Copy built frontend static files
-COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
-
 # Create .env placeholder
 RUN touch .env
 
-# Expose port
-EXPOSE 8000
+# Local web API port (see docs/WEB_API.md)
+EXPOSE 8787
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/api/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8787/api/health')" || exit 1
 
-# Run the unified service
-CMD ["poetry", "run", "python", "-m", "src.adapters.telegram.app"]
+# Run the local web API (engine + daemon + REST/SSE/WS).
+# Implements the contract in docs/WEB_API.md (src/adapters/api).
+CMD ["poetry", "run", "python", "-m", "src.adapters.api"]
