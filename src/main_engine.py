@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from .agents.brainstorming import BrainstormingAgent
 from .agents.interest import InterestAgent
+from .config.database import DatabaseConfig
 from .core.bus import EventBus
 from .core.commands import Command
 from .core.engine import Engine
@@ -64,9 +65,18 @@ class PersonalAssistantEngine:
         logger.info("      ✓ Vector DB ready")
 
         # Initialize unified knowledge store
-        knowledge_db = self.config.get("knowledge_db", "./data/knowledge.db")
-        logger.info(f"[3/6] Initializing unified knowledge store (SQLite: {knowledge_db})...")
-        self._knowledge_store = UnifiedKnowledgeStore(knowledge_db)
+        logger.info("[3/6] Initializing unified knowledge store...")
+        db_config = DatabaseConfig.from_env()
+        logger.info(f"      Using {db_config.db_type.upper()} backend")
+        if db_config.db_type == "postgresql":
+            logger.info(f"      Host: {db_config.postgresql_host}:{db_config.postgresql_port}")
+        else:
+            logger.info(f"      Path: {db_config.sqlite_path}")
+
+        self._knowledge_store = UnifiedKnowledgeStore(
+            db_type=db_config.db_type,
+            **db_config.to_connection_kwargs()
+        )
         await self._knowledge_store.initialize()
         logger.info("      ✓ Knowledge store ready")
 
@@ -131,6 +141,12 @@ class PersonalAssistantEngine:
         """Get the event bus for streaming."""
         assert self._engine is not None
         return self._engine._bus
+
+    @property
+    def store(self) -> UnifiedKnowledgeStore:
+        """Get the unified knowledge store (for read-only adapters/dashboards)."""
+        assert self._knowledge_store is not None
+        return self._knowledge_store
 
     async def submit(self, cmd: Command) -> str:
         """Submit a command to the core engine for async execution."""
