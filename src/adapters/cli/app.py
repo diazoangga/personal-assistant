@@ -492,6 +492,27 @@ def status_cmd():
     console.print(f"Engine:         {'[green]Ready[/]' if _engine else '[yellow]Not initialized[/]'}")
 
 
+@app.command("serve")
+def serve_cmd(
+    host: str = typer.Option(None, "--host", help="Bind address (default: $LOCAL_API_HOST or 127.0.0.1)"),
+    port: int = typer.Option(None, "--port", help="Port (default: $LOCAL_API_PORT or 8787)"),
+):
+    """Run the local web API (engine + daemon + REST/SSE/WS) for the desktop app."""
+    import os
+
+    if host:
+        os.environ["LOCAL_API_HOST"] = host
+    if port:
+        os.environ["LOCAL_API_PORT"] = str(port)
+
+    from ...adapters.api.app import main as serve_main
+
+    bind_host = os.getenv("LOCAL_API_HOST", "127.0.0.1")
+    bind_port = os.getenv("LOCAL_API_PORT", "8787")
+    console.print(f"[bold green]Starting local web API[/] at http://{bind_host}:{bind_port}  (docs at /docs)")
+    serve_main()
+
+
 @app.command("repl")
 def repl_cmd():
     """Interactive REPL mode."""

@@ -1,30 +1,60 @@
 version: '3.8'
 
 services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: pa-qdrant
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: personal-assistant-postgres
+    environment:
+      POSTGRES_USER: ${DB_POSTGRESQL_USER:-pa_user}
+      POSTGRES_PASSWORD: ${DB_POSTGRESQL_PASSWORD:-secure_password}
+      POSTGRES_DB: ${DB_POSTGRESQL_DATABASE:-personal_assistant}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
-      - "6333:6333"
+      - "${DB_POSTGRESQL_PORT:-5432}:5432"
     volumes:
-      - ./.data/qdrant:/qdrant/storage
-    restart: unless-stopped
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "password_encryption=scram-sha-256"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_POSTGRESQL_USER:-pa_user}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - pa-network
 
-  # Alternative: Use pgvector instead of Qdrant
-  # Uncomment if you prefer Postgres + pgvector
-  # postgres:
-  #   image: pgvector/pgvector:pg16
-  #   container_name: pa-postgres
-  #   environment:
-  #     POSTGRES_PASSWORD: pa_password
-  #     POSTGRES_DB: personal_assistant
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - ./.data/pg:/var/lib/postgresql/data
-  #   restart: unless-stopped
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: personal-assistant-qdrant
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT_API_KEY: ""
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - pa-network
+
+volumes:
+  postgres_data:
+    driver: local
+  qdrant_storage:
+    driver: local
+
+networks:
+  pa-network:
+    driver: bridge

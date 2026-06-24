@@ -1,6 +1,5 @@
-"""Unified knowledge store - merges memory, citations, and concept graphs into single SQLite database."""
+"""Unified knowledge store - merges memory, citations, and concept graphs into database (SQLite or PostgreSQL)."""
 
-import aiosqlite
 import asyncio
 import hashlib
 import json
@@ -8,6 +7,8 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from .db_connection import DBConnection, create_connection
 
 
 def utcnow() -> datetime:
@@ -40,56 +41,78 @@ def compute_citation_id(citation: dict[str, Any]) -> str:
 
 class UnifiedKnowledgeStore:
     """
-    Unified SQLite knowledge store that consolidates:
+    Unified knowledge store that consolidates:
     - User memory (interests, profile, opportunities)
     - Citation graph (research papers)
     - Knowledge graph (concepts and relationships)
-    
+
+    Supports both SQLite and PostgreSQL backends via DBConnection abstraction.
     All cross-references are maintained via linking tables.
     """
 
-    def __init__(self, db_path: str = "./data/knowledge.db"):
-        self.db_path = db_path
-        self._db: Optional[aiosqlite.Connection] = None
+    def __init__(self, db: Optional[DBConnection] = None, db_type: str = "sqlite", **kwargs):
+        """Initialize store with database connection.
+
+        Args:
+            db: Existing DBConnection instance (takes precedence)
+            db_type: "sqlite" or "postgresql" (used to create connection if db is None)
+            **kwargs: Connection parameters (db_path for sqlite, host/port/user/password for postgresql)
+        """
+        if db is not None:
+            self._db = db
+        else:
+            self._db = create_connection(db_type, **kwargs)
+
+    def _is_sqlite(self) -> bool:
+        """Check if using SQLite backend (vs PostgreSQL)."""
+        from .db_connection import SQLiteConnection
+        return isinstance(self._db, SQLiteConnection)
 
     async def initialize(self) -> None:
         """Initialize database connection and create tables."""
-        logger.info(f"Initializing unified knowledge store: {self.db_path}")
-        
-        # Ensure directory exists
-        db_dir = Path(self.db_path).parent
-        db_dir.mkdir(parents=True, exist_ok=True)
-        
-        self._db = await aiosqlite.connect(self.db_path)
-        self._db.row_factory = aiosqlite.Row
-        
-        # Enable foreign keys
-        await self._db.execute("PRAGMA foreign_keys = ON")
-        
-        # Create all tables
-        await self._create_tables()
-        
+        logger.info(f"Initializing unified knowledge store...")
+
+        await self._db.initialize()
+
+        # Create all tables (SQLite only; PostgreSQL schema already created via init_postgres_schema.py)
+        if self._is_sqlite():
+            await self._create_tables()
+        else:
+            logger.info("Using PostgreSQL backend (schema pre-created)")
+
         logger.info("Unified knowledge store initialized successfully")
 
     async def _add_column_if_missing(self, table: str, column: str, ddl: str) -> None:
-        """Idempotently add a column to an existing table (additive migration)."""
-        cursor = await self._db.execute(f"PRAGMA table_info({table})")
-        rows = await cursor.fetchall()
-        existing = {row["name"] for row in rows}
-        if column not in existing:
-            await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        """Idempotently add a column to an existing table (SQLite only, for backward compat).
+
+        PostgreSQL schema is created fully up-to-date via init_postgres_schema.py,
+        so this additive migration only applies to SQLite databases.
+        """
+        if not self._is_sqlite():
+            return
+        try:
+            rows = await self._db.fetchall(f"PRAGMA table_info({table})")
+            existing = {row["name"] for row in rows}
+            if column not in existing:
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        except Exception:
+            logger.warning(f"Could not check/add column {table}.{column}", exc_info=True)
 
     async def _migrate_citation_relationships(self) -> None:
-        """Recreate citation_relationships with a UNIQUE edge constraint if it predates one.
+        """Recreate citation_relationships with a UNIQUE edge constraint (SQLite only).
 
         The table previously had no UNIQUE(source_id, target_id, relationship_type), so
         re-research would duplicate edges. SQLite can't ALTER a UNIQUE constraint in, so an
         old-shape table is renamed, recreated, and its rows are copied over (deduplicated).
+
+        PostgreSQL doesn't need this migration (schema is created correctly via init script).
         """
-        cursor = await self._db.execute(
+        if not self._is_sqlite():
+            return
+
+        row = await self._db.fetchone(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='citation_relationships'"
         )
-        row = await cursor.fetchone()
         if row is None or "UNIQUE" in (row["sql"] or ""):
             return  # doesn't exist yet, or already migrated
 
@@ -449,20 +472,18 @@ class UnifiedKnowledgeStore:
 
     async def get_interest(self, interest_id: str) -> Optional[dict[str, Any]]:
         """Get a single interest by ID."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM interests WHERE id = ?",
             (interest_id,),
         )
-        row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def get_interests(self, min_strength: float = 0.0) -> list[dict[str, Any]]:
         """Get all interests above minimum strength threshold."""
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT * FROM interests WHERE strength >= ? ORDER BY strength DESC",
             (min_strength,),
         )
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def delete_interest(self, interest_id: str) -> None:
@@ -499,21 +520,19 @@ class UnifiedKnowledgeStore:
 
     async def get_interest_embedding(self, interest_id: str) -> Optional[bytes]:
         """Get cached embedding for an interest."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT embedding FROM interest_embeddings WHERE interest_id = ?",
             (interest_id,),
         )
-        row = await cursor.fetchone()
         return row["embedding"] if row else None
 
     async def get_all_interest_embeddings(self) -> list[tuple[str, bytes]]:
         """Get all cached interest embeddings with their IDs."""
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT ie.interest_id, ie.embedding, i.label "
             "FROM interest_embeddings ie "
             "JOIN interests i ON ie.interest_id = i.id"
         )
-        rows = await cursor.fetchall()
         return [(row["interest_id"], row["embedding"], row["label"]) for row in rows]
 
     async def get_interest_embeddings(self, min_strength: float = 0.2) -> list[tuple[str, bytes, str]]:
@@ -521,14 +540,13 @@ class UnifiedKnowledgeStore:
         
         Returns list of (interest_id, embedding_bytes, label) tuples.
         """
-        cursor = await self._db.execute("""
+        rows = await self._db.fetchall("""
             SELECT ie.interest_id, ie.embedding, i.label
             FROM interest_embeddings ie
             JOIN interests i ON ie.interest_id = i.id
             WHERE i.strength >= ?
             ORDER BY i.strength DESC
         """, (min_strength,))
-        rows = await cursor.fetchall()
         return [(row["interest_id"], row["embedding"], row["label"]) for row in rows]
 
     # ========== CONCEPT METHODS ==========
@@ -554,26 +572,23 @@ class UnifiedKnowledgeStore:
 
     async def get_concept(self, concept_id: str) -> Optional[dict[str, Any]]:
         """Get a concept by ID."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM concepts WHERE id = ?",
             (concept_id,),
         )
-        row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def get_all_concepts(self) -> list[dict[str, Any]]:
         """Get all concepts."""
-        cursor = await self._db.execute("SELECT * FROM concepts ORDER BY label")
-        rows = await cursor.fetchall()
+        rows = await self._db.fetchall("SELECT * FROM concepts ORDER BY label")
         return [dict(row) for row in rows]
 
     async def find_concepts_by_label(self, label_pattern: str) -> list[dict[str, Any]]:
         """Find concepts matching label pattern (SQL LIKE)."""
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT * FROM concepts WHERE label LIKE ? OR label = ?",
             (f"%{label_pattern}%", label_pattern),
         )
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     # ========== CONCEPT RELATIONSHIP / GRAPH TRAVERSAL METHODS ==========
@@ -582,11 +597,10 @@ class UnifiedKnowledgeStore:
         self, source_id: str, target_id: str, relation_type: str, weight: float = 1.0
     ) -> None:
         """Insert or update a relationship edge between two concepts."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT id FROM concept_relationships WHERE source_id = ? AND target_id = ? AND relation_type = ?",
             (source_id, target_id, relation_type),
         )
-        row = await cursor.fetchone()
         if row:
             await self._db.execute(
                 "UPDATE concept_relationships SET weight = ? WHERE id = ?",
@@ -604,11 +618,10 @@ class UnifiedKnowledgeStore:
 
     async def get_concept_relationships(self, concept_id: str) -> list[dict[str, Any]]:
         """Get all relationship edges touching a concept, in either direction."""
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT * FROM concept_relationships WHERE source_id = ? OR target_id = ?",
             (concept_id, concept_id),
         )
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def relevant_subgraphs(
@@ -671,8 +684,7 @@ class UnifiedKnowledgeStore:
         for field in ("doi", "arxiv_id", "semantic_scholar_id"):
             value = citation.get(field)
             if value:
-                cursor = await self._db.execute(f"SELECT id FROM citations WHERE {field} = ?", (value,))
-                row = await cursor.fetchone()
+                row = await self._db.fetchone(f"SELECT id FROM citations WHERE {field} = ?", (value,))
                 if row:
                     return row["id"]
         return compute_citation_id(citation)
@@ -748,27 +760,24 @@ class UnifiedKnowledgeStore:
 
     async def get_citation(self, citation_id: str) -> Optional[dict[str, Any]]:
         """Get a citation by ID."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM citations WHERE id = ?",
             (citation_id,),
         )
-        row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def get_all_citations(self) -> list[dict[str, Any]]:
         """Get all citations."""
-        cursor = await self._db.execute("SELECT * FROM citations ORDER BY published_date DESC")
-        rows = await cursor.fetchall()
+        rows = await self._db.fetchall("SELECT * FROM citations ORDER BY published_date DESC")
         return [dict(row) for row in rows]
 
     async def find_citations_by_title(self, pattern: str) -> list[dict[str, Any]]:
         """Find citations with a title matching pattern (SQL LIKE) — fallback lookup
         when a topic has no linked interest to query through."""
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT * FROM citations WHERE title LIKE ?",
             (f"%{pattern}%",),
         )
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def update_citation_notes(
@@ -784,8 +793,8 @@ class UnifiedKnowledgeStore:
 
     async def is_known_citation(self, citation_id: str) -> bool:
         """Whether a citation already exists — the novelty gate for citation-chase BFS."""
-        cursor = await self._db.execute("SELECT 1 FROM citations WHERE id = ?", (citation_id,))
-        return (await cursor.fetchone()) is not None
+        row = await self._db.fetchone("SELECT 1 FROM citations WHERE id = ?", (citation_id,))
+        return row is not None
 
     # ========== CITATION GRAPH (cites edges) ==========
 
@@ -804,11 +813,10 @@ class UnifiedKnowledgeStore:
 
     async def get_citation_edges(self, citation_id: str) -> list[dict[str, Any]]:
         """Get all citation edges touching a paper, in either direction (cites / cited-by)."""
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT * FROM citation_relationships WHERE source_id = ? OR target_id = ?",
             (citation_id, citation_id),
         )
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def citation_subgraph(
@@ -867,26 +875,24 @@ class UnifiedKnowledgeStore:
 
     async def get_linked_concepts_for_interest(self, interest_id: str) -> list[dict[str, Any]]:
         """Get all concepts linked to an interest."""
-        cursor = await self._db.execute("""
+        rows = await self._db.fetchall("""
             SELECT c.*, icl.link_type, icl.confidence
             FROM concepts c
             JOIN interest_concept_links icl ON c.id = icl.concept_id
             WHERE icl.interest_id = ?
             ORDER BY icl.confidence DESC
         """, (interest_id,))
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def get_linked_interests_for_concept(self, concept_id: str) -> list[dict[str, Any]]:
         """Get all interests linked to a concept."""
-        cursor = await self._db.execute("""
+        rows = await self._db.fetchall("""
             SELECT i.*, icl.link_type, icl.confidence
             FROM interests i
             JOIN interest_concept_links icl ON i.id = icl.interest_id
             WHERE icl.concept_id = ?
             ORDER BY i.strength DESC
         """, (concept_id,))
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def link_citation_to_concept(
@@ -906,25 +912,23 @@ class UnifiedKnowledgeStore:
 
     async def get_linked_concepts_for_citation(self, citation_id: str) -> list[dict[str, Any]]:
         """Get all concepts linked to a citation."""
-        cursor = await self._db.execute("""
+        rows = await self._db.fetchall("""
             SELECT c.*, ccl.relation_type, ccl.evidence_text
             FROM concepts c
             JOIN citation_concept_links ccl ON c.id = ccl.concept_id
             WHERE ccl.citation_id = ?
         """, (citation_id,))
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def get_linked_citations_for_concept(self, concept_id: str) -> list[dict[str, Any]]:
         """Get all citations linked to a concept."""
-        cursor = await self._db.execute("""
+        rows = await self._db.fetchall("""
             SELECT ci.*, ccl.relation_type, ccl.evidence_text
             FROM citations ci
             JOIN citation_concept_links ccl ON ci.id = ccl.citation_id
             WHERE ccl.concept_id = ?
             ORDER BY ci.published_date DESC
         """, (concept_id,))
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def link_interest_to_citation(
@@ -947,14 +951,13 @@ class UnifiedKnowledgeStore:
 
     async def get_citations_for_interest(self, interest_id: str) -> list[dict[str, Any]]:
         """Get all citations linked to an interest, most relevant first."""
-        cursor = await self._db.execute("""
+        rows = await self._db.fetchall("""
             SELECT c.*, icl.relevance, icl.discovered_run_id
             FROM citations c
             JOIN interest_citation_links icl ON c.id = icl.citation_id
             WHERE icl.interest_id = ?
             ORDER BY icl.relevance DESC
         """, (interest_id,))
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def get_existing_research(
@@ -1031,10 +1034,9 @@ class UnifiedKnowledgeStore:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
 
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             f"SELECT * FROM research_runs {where} ORDER BY started_at DESC LIMIT ?", params
         )
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     # ========== UTILITY METHODS ==========
@@ -1050,16 +1052,14 @@ class UnifiedKnowledgeStore:
         stats = {}
         
         for table in tables:
-            cursor = await self._db.execute(f"SELECT COUNT(*) as count FROM {table}")
-            row = await cursor.fetchone()
+            row = await self._db.fetchone(f"SELECT COUNT(*) as count FROM {table}")
             stats[table] = row["count"]
         
         return stats
 
     async def execute_query(self, query: str, params: tuple = ()) -> list[dict[str, Any]]:
         """Execute a custom query and return results."""
-        cursor = await self._db.execute(query, params)
-        rows = await cursor.fetchall()
+        rows = await self._db.fetchall(query, params)
         return [dict(row) for row in rows]
 
     # ========== INTEREST SIGNAL EVIDENCE METHODS ==========
@@ -1095,30 +1095,28 @@ class UnifiedKnowledgeStore:
         """Compute interest strength as a decayed sum of signal evidence."""
         import math
         
-        cursor = await self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT confidence, timestamp FROM interest_signal_evidence WHERE topic = ?",
             (topic,),
         )
-        rows = await cursor.fetchall()
 
         if not rows:
             return 0.0
 
         now = utcnow()
         total = 0.0
-        for confidence, ts_str in rows:
-            age_hours = (now - datetime.fromisoformat(ts_str)).total_seconds() / 3600
-            total += confidence * math.exp(-age_hours / decay_hours)
+        for row in rows:
+            age_hours = (now - datetime.fromisoformat(row["timestamp"])).total_seconds() / 3600
+            total += row["confidence"] * math.exp(-age_hours / decay_hours)
 
         return max(0.0, min(1.0, total))
 
     async def should_research(self, topic: str, cooldown_hours: int = 24) -> bool:
         """Check if enough time has passed since last research on this topic."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT last_researched_at FROM interest_research_log WHERE topic = ?",
             (topic,),
         )
-        row = await cursor.fetchone()
         
         if not row:
             return True
@@ -1191,11 +1189,10 @@ class UnifiedKnowledgeStore:
         user_id: str = "cli"
     ) -> str:
         """Get existing session or create new one. Returns session_id."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT id FROM conversation_sessions WHERE id = ?",
             (session_id,)
         )
-        row = await cursor.fetchone()
         if not row:
             await self.create_conversation_session(session_id, user_id)
         return session_id
@@ -1210,11 +1207,10 @@ class UnifiedKnowledgeStore:
         """Add a turn to a conversation session."""
         now = utcnow().isoformat()
         
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT MAX(turn_number) as max_turn FROM conversation_turns WHERE session_id = ?",
             (session_id,)
         )
-        row = await cursor.fetchone()
         turn_number = (row["max_turn"] or 0) + 1
         
         await self._db.execute("""
@@ -1237,22 +1233,20 @@ class UnifiedKnowledgeStore:
         limit: int = 50
     ) -> list[dict[str, Any]]:
         """Get conversation history for a session."""
-        cursor = await self._db.execute("""
-            SELECT * FROM conversation_turns 
-            WHERE session_id = ? 
-            ORDER BY turn_number DESC 
+        rows = await self._db.fetchall("""
+            SELECT * FROM conversation_turns
+            WHERE session_id = ?
+            ORDER BY turn_number DESC
             LIMIT ?
         """, (session_id, limit))
-        rows = await cursor.fetchall()
         return [dict(row) for row in reversed(rows)]
 
     async def get_session_info(self, session_id: str) -> Optional[dict[str, Any]]:
         """Get session metadata."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM conversation_sessions WHERE id = ?",
             (session_id,)
         )
-        row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def clear_conversation_history(self, session_id: str) -> None:
@@ -1282,21 +1276,19 @@ class UnifiedKnowledgeStore:
                 updated_at = excluded.updated_at
         """, (user_id, now, now))
         
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT total_questions FROM user_stats WHERE user_id = ?",
             (user_id,)
         )
-        row = await cursor.fetchone()
         await self._db.commit()
         return row["total_questions"]
 
     async def get_user_stats(self, user_id: str) -> Optional[dict[str, Any]]:
         """Get statistics for a user."""
-        cursor = await self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM user_stats WHERE user_id = ?",
             (user_id,)
         )
-        row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def increment_knowledge_entries(self, user_id: str) -> None:
@@ -1342,30 +1334,27 @@ class UnifiedKnowledgeStore:
     ) -> list[dict[str, Any]]:
         """Get knowledge entries filtered by user and quality."""
         if user_id:
-            cursor = await self._db.execute("""
-                SELECT * FROM knowledge_entries 
+            rows = await self._db.fetchall("""
+                SELECT * FROM knowledge_entries
                 WHERE user_id = ? AND quality_score >= ?
                 ORDER BY quality_score DESC, created_at DESC
                 LIMIT ?
             """, (user_id, min_quality, limit))
         else:
-            cursor = await self._db.execute("""
-                SELECT * FROM knowledge_entries 
+            rows = await self._db.fetchall("""
+                SELECT * FROM knowledge_entries
                 WHERE quality_score >= ?
                 ORDER BY quality_score DESC, created_at DESC
                 LIMIT ?
             """, (min_quality, limit))
-        
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def search_knowledge_entries(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         """Search knowledge entries by question/answer content."""
-        cursor = await self._db.execute("""
-            SELECT * FROM knowledge_entries 
+        rows = await self._db.fetchall("""
+            SELECT * FROM knowledge_entries
             WHERE question LIKE ? OR answer LIKE ?
             ORDER BY quality_score DESC
             LIMIT ?
         """, (f"%{query}%", f"%{query}%", limit))
-        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
