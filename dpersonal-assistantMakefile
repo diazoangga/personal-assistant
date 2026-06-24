@@ -1,0 +1,45 @@
+.PHONY: help setup backend frontend dev docker logs test lint format
+
+help:
+	@echo "Personal Assistant Telegram Mini App - Development Commands"
+	@echo ""
+	@echo "Setup:"
+	@echo "  make setup          Install all dependencies"
+	@echo ""
+	@echo "Development:"
+	@echo "  make backend        Start backend only"
+	@echo "  make frontend       Start frontend only"
+	@echo ""
+	@echo "Docker:"
+	@echo "  make docker         Build and start with Docker Compose"
+	@echo "  make docker-down    Stop Docker Compose services"
+	@echo ""
+	@echo "Testing:"
+	@echo "  make test           Run all tests"
+	@echo "  make lint           Lint code"
+	@echo "  make format         Format code"
+
+setup:
+	poetry install
+	cd frontend && npm install
+
+backend:
+	poetry run python -m src.adapters.telegram.app
+
+frontend:
+	cd frontend && npm run dev
+
+test:
+	poetry run pytest tests/ -v
+
+lint:
+	poetry run mypy src/ || true
+
+format:
+	poetry run black src/
+
+docker:
+	docker-compose up --build
+
+docker-down:
+	docker-compose down
