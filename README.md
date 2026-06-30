@@ -84,10 +84,27 @@ python -m src.adapters.cli.app
 
 ## Documentation
 
-- [Architecture & Plans](docs/personal-assistant.plans.md)
-- [Implementation Roadmap](docs/personal-assistant.implementation.md)
-- [Agent Architecture Guide](docs/agent.architecture-guide.md)
-- [OpenRouter Runtime](docs/impl/07-openrouter-llm-runtime.md)
+The documentation set is organized under [docs/](docs/) and indexed by the
+[Documentation Plan](docs/documentation-plan.md). Start there. Highlights:
+
+- **Architecture** — [overview](docs/architecture/overview.md) ·
+  [command/event flow](docs/architecture/command-event-flow.md) ·
+  [signal flow](docs/architecture/signal-flow.md) ·
+  [decisions (ADRs)](docs/architecture/decisions/)
+- **Agents** — [interest](docs/agents/interest.md) ·
+  [research](docs/agents/research.md) · [brainstorming](docs/agents/brainstorming.md) ·
+  [roadmap](docs/agents/roadmap.md)
+- **Storage** — [knowledge store](docs/storage/knowledge-store.md) ·
+  [vector store](docs/storage/vector-store.md) · [postgres](docs/storage/postgres.md)
+- **Connectors** — [contract](docs/connectors/connector-contract.md) +
+  github / browser / slack
+- **API** — [REST reference](docs/api/rest-reference.md) ·
+  [streaming (SSE/WS)](docs/api/streaming.md)
+- **LLM** — [OpenRouter runtime](docs/llm/openrouter-runtime.md)
+- **Ops** — [local dev](docs/ops/local-dev.md) ·
+  [configuration](docs/ops/configuration.md) · [daemon](docs/ops/daemon.md)
+
+Pre-rewrite docs are preserved under [docs/_archive/](docs/_archive/).
 
 ## Project Structure
 

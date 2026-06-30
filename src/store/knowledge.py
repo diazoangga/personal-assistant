@@ -551,9 +551,15 @@ class UnifiedKnowledgeStore:
 
     # ========== CONCEPT METHODS ==========
 
-    async def upsert_concept(self, concept: dict[str, Any]) -> None:
-        """Insert or update a concept."""
+    async def upsert_concept(self, concept: dict[str, Any]) -> str:
+        """Insert or update a concept. Returns the concept ID."""
         now = utcnow().isoformat()
+        
+        concept_id = concept.get("id")
+        if not concept_id:
+            label = concept.get("label", "")
+            category = concept.get("category", "general")
+            concept_id = compute_concept_id(label, category)
         
         await self._db.execute("""
             INSERT INTO concepts (id, label, description, category, created_at)
@@ -562,13 +568,14 @@ class UnifiedKnowledgeStore:
                 description = excluded.description,
                 category = excluded.category
         """, (
-            concept.get("id"),
+            concept_id,
             concept.get("label"),
             concept.get("description"),
             concept.get("category"),
             concept.get("created_at", now),
         ))
         await self._db.commit()
+        return concept_id
 
     async def get_concept(self, concept_id: str) -> Optional[dict[str, Any]]:
         """Get a concept by ID."""
@@ -1271,7 +1278,7 @@ class UnifiedKnowledgeStore:
             INSERT INTO user_stats (user_id, total_questions, last_active, updated_at)
             VALUES (?, 1, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                total_questions = total_questions + 1,
+                total_questions = user_stats.total_questions + 1,
                 last_active = excluded.last_active,
                 updated_at = excluded.updated_at
         """, (user_id, now, now))
@@ -1298,7 +1305,7 @@ class UnifiedKnowledgeStore:
             INSERT INTO user_stats (user_id, total_knowledge_entries, updated_at)
             VALUES (?, 1, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                total_knowledge_entries = total_knowledge_entries + 1,
+                total_knowledge_entries = user_stats.total_knowledge_entries + 1,
                 updated_at = excluded.updated_at
         """, (user_id, now))
         await self._db.commit()
